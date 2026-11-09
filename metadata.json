@@ -1,0 +1,6 @@
+{
+  "name": "Cookie3D Studio - Cortadores e Carimbos 3D",
+  "description": "Crie, personalize e exporte cortadores de biscoito e carimbos a partir de modelos prontos e desenhos lineart para impressão 3D (arquivos STL).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
