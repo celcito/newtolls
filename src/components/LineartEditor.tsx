@@ -10,13 +10,23 @@ import {
   chaikinSmooth,
   catmullRomSpline,
   StrokeStabilizer,
-  generateRegularPolygon,
   generateEllipse,
   generateRectangle,
   calculatePolygonArea,
 } from '../utils/drawingPrecision';
 import {
+  BezierAnchor,
+  BezierNodeMode,
+  evaluateCubicBezier,
+  sampleBezierPath,
+  polylineToBezierAnchors,
+  updateAnchorHandle,
+  setAnchorMode,
+  insertBezierAnchorOnSegment,
+  moveBezierAnchor,
+  transformBezierAnchors,
   getPathBounds,
+  rotatePoint,
   rotatePath,
   scalePath,
   translatePath,
@@ -27,12 +37,12 @@ import {
   exportPathsToSVG,
   downloadSVGFile,
   parseSvgStringToPaths,
-  BoundingBox,
 } from '../utils/vectorStudioUtils';
 import {
   X,
   Upload,
   Pen,
+  PenTool,
   RotateCcw,
   Sparkles,
   Check,
@@ -47,23 +57,21 @@ import {
   Minus,
   Star,
   Heart,
-  ShieldCheck,
   Eraser,
   Layers,
   Crosshair,
-  Info,
   MousePointer,
   Waypoints,
   Maximize2,
-  Minimize2,
   RotateCw,
   FlipHorizontal,
   FlipVertical,
   FileCode,
   Copy,
-  PlusCircle,
   Trash2,
   Download as DownloadIcon,
+  Spline,
+  CornerDownRight,
 } from 'lucide-react';
 
 interface LineartEditorProps {
@@ -73,9 +81,10 @@ interface LineartEditorProps {
 }
 
 type MainTool =
-  | 'select' // Illustrator Selection Tool (V) - move, scale, rotate
-  | 'node' // Illustrator Direct Selection / Inkscape Node Tool (A / N) - edit vertices
-  | 'pen' // Freehand pen with stabilizer
+  | 'select' // Selection Tool (V) - move, scale, rotate
+  | 'node' // Direct Selection / Bézier Node & Handle Tool (A)
+  | 'bezier' // Cubic Bézier Pen Tool (B) - click for corner, drag for handles
+  | 'pen' // Freehand pen with stabilizer (P)
   | 'line' // Straight polyline
   | 'circle' // Ellipse / circle
   | 'rect' // Rectangle / box
@@ -84,10 +93,12 @@ type MainTool =
   | 'eraser'; // Eraser
 
 type SmoothingLevel = 'none' | 'medium' | 'high';
+type GridSpacing = 2 | 5 | 10 | 12.5;
 
 interface StrokeItem {
   id: string;
   points: Point2D[];
+  bezierAnchors?: BezierAnchor[];
   isClosed: boolean;
   isOuter: boolean;
 }
@@ -110,8 +121,10 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
   // Drawing & Precision Parameters
   const [brushSize, setBrushSize] = useState<number>(4);
   const [smoothingLevel, setSmoothingLevel] = useState<SmoothingLevel>('medium');
+  const [autoBezierFreehand, setAutoBezierFreehand] = useState<boolean>(true);
   const [showGrid, setShowGrid] = useState<boolean>(true);
-  const [enableSnapGrid, setEnableSnapGrid] = useState<boolean>(false);
+  const [enableSnapGrid, setEnableSnapGrid] = useState<boolean>(true);
+  const [gridSpacing, setGridSpacing] = useState<GridSpacing>(5);
   const [showCenterGuides, setShowCenterGuides] = useState<boolean>(true);
   const [mirrorMode, setMirrorMode] = useState<boolean>(false);
   const [autoCloseLoop, setAutoCloseLoop] = useState<boolean>(true);
@@ -121,18 +134,36 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
   const [undoStack, setUndoStack] = useState<StrokeItem[][]>([]);
   const [redoStack, setRedoStack] = useState<StrokeItem[][]>([]);
 
+  // Active Bézier Pen construction state
+  const [bezierDraft, setBezierDraft] = useState<BezierAnchor[]>([]);
+  const bezierDraftRef = useRef<BezierAnchor[]>([]);
+  const isDraggingBezierHandleRef = useRef<boolean>(false);
+  const bezierClosingDragRef = useRef<boolean>(false);
+
   // Dragging / Transforming State
   const drawCanvasRef = useRef<HTMLCanvasElement>(null);
   const isPointerDownRef = useRef<boolean>(false);
-  const dragModeRef = useRef<'none' | 'draw' | 'move-shape' | 'move-node' | 'scale-handle' | 'rotate-handle'>('none');
+  const dragModeRef = useRef<
+    | 'none'
+    | 'draw'
+    | 'move-shape'
+    | 'move-node'
+    | 'move-handle-in'
+    | 'move-handle-out'
+    | 'scale-handle'
+    | 'rotate-handle'
+  >('none');
   const activeHandleRef = useRef<string | null>(null);
   const startDragPtRef = useRef<Point2D | null>(null);
   const originalPointsRef = useRef<Point2D[]>([]);
+  const originalAnchorsRef = useRef<BezierAnchor[] | undefined>(undefined);
   const currentRawPointsRef = useRef<Point2D[]>([]);
   const stabilizerRef = useRef<StrokeStabilizer>(new StrokeStabilizer(0.35));
+  const isAltPressedRef = useRef<boolean>(false);
 
-  // Visual state
+  // Visual Cursor & Snap Feedback State
   const [cursorPos, setCursorPos] = useState<Point2D | null>(null);
+  const [rawCursorPos, setRawCursorPos] = useState<Point2D | null>(null);
   const [isNearStart, setIsNearStart] = useState<boolean>(false);
   const [svgModalOpen, setSvgModalOpen] = useState<boolean>(false);
   const [svgTextInput, setSvgTextInput] = useState<string>('');
@@ -144,6 +175,11 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const svgFileInputRef = useRef<HTMLInputElement>(null);
+
+  // Keep bezierDraftRef synced
+  useEffect(() => {
+    bezierDraftRef.current = bezierDraft;
+  }, [bezierDraft]);
 
   // Synchronize stabilizer with smoothing level
   useEffect(() => {
@@ -157,13 +193,21 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
   }, [smoothingLevel]);
 
   // History management
-  const recordHistory = useCallback((newStrokes: StrokeItem[]) => {
-    setUndoStack((prev) => [...prev, strokes]);
-    setRedoStack([]);
-    setStrokes(newStrokes);
-  }, [strokes]);
+  const recordHistory = useCallback(
+    (newStrokes: StrokeItem[]) => {
+      setUndoStack((prev) => [...prev, strokes]);
+      setRedoStack([]);
+      setStrokes(newStrokes);
+    },
+    [strokes]
+  );
 
   const handleUndo = useCallback(() => {
+    if (bezierDraftRef.current.length > 0) {
+      const nextDraft = bezierDraftRef.current.slice(0, -1);
+      setBezierDraft(nextDraft);
+      return;
+    }
     if (undoStack.length === 0) return;
     const previous = undoStack[undoStack.length - 1];
     setUndoStack((prev) => prev.slice(0, prev.length - 1));
@@ -179,42 +223,6 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
     setStrokes(next);
   }, [redoStack, strokes]);
 
-  // Keyboard shortcuts (V, A, P, Ctrl+Z, Delete, etc.)
-  useEffect(() => {
-    if (!isOpen) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement;
-      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
-        return;
-      }
-
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
-        if (e.shiftKey) handleRedo();
-        else handleUndo();
-        e.preventDefault();
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
-        handleRedo();
-        e.preventDefault();
-      } else if (e.key === 'v' || e.key === 'V') {
-        setActiveTool('select');
-      } else if (e.key === 'a' || e.key === 'A') {
-        setActiveTool('node');
-      } else if (e.key === 'p' || e.key === 'P') {
-        setActiveTool('pen');
-      } else if (e.key === 'Delete' || e.key === 'Backspace') {
-        if (activeTool === 'node' && selectedStrokeId && selectedNodeIndex !== null) {
-          handleDeleteSelectedNode();
-          e.preventDefault();
-        } else if (selectedStrokeId) {
-          handleDeleteSelectedStroke();
-          e.preventDefault();
-        }
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, handleUndo, handleRedo, activeTool, selectedStrokeId, selectedNodeIndex]);
-
   // Recalculate outer vs inner contours automatically
   const reclassifyStrokes = useCallback((strokeList: StrokeItem[]): StrokeItem[] => {
     if (strokeList.length === 0) return [];
@@ -222,7 +230,6 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
       return [{ ...strokeList[0], isOuter: true }];
     }
 
-    // Keep existing outer if valid
     const existingOuter = strokeList.find((s) => s.isOuter);
     if (existingOuter) {
       return strokeList;
@@ -246,29 +253,189 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
     }));
   }, []);
 
-  // Coordinate conversion
-  const getCanvasPoint = (e: React.PointerEvent<HTMLCanvasElement>): Point2D => {
-    const canvas = drawCanvasRef.current;
-    if (!canvas) return [0, 0];
-    const rect = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
+  // Commit active Bézier draft path into strokes
+  const commitBezierDraft = useCallback(
+    (closed: boolean) => {
+      const draft = bezierDraftRef.current;
+      if (draft.length < 2) {
+        setBezierDraft([]);
+        return;
+      }
 
-    let x = (e.clientX - rect.left) * scaleX;
-    let y = (e.clientY - rect.top) * scaleY;
+      const sampled = sampleBezierPath(draft, closed, 20);
+      const newId = `bezier_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+      const newStroke: StrokeItem = {
+        id: newId,
+        points: sampled,
+        bezierAnchors: draft,
+        isClosed: closed,
+        isOuter: false,
+      };
 
-    let pctX = (x / canvas.width) * 100;
-    let pctY = (y / canvas.height) * 100;
+      const nextStrokes = [...strokes, newStroke];
 
-    if (enableSnapGrid) {
-      [pctX, pctY] = snapToGrid([pctX, pctY], 5);
+      if (mirrorMode) {
+        const mirroredAnchors = transformBezierAnchors(draft, ([x, y]) => [
+          Math.max(0, Math.min(100, 100 - x)),
+          y,
+        ]);
+        nextStrokes.push({
+          id: `bezier_mirror_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          points: sampleBezierPath(mirroredAnchors, closed, 20),
+          bezierAnchors: mirroredAnchors,
+          isClosed: closed,
+          isOuter: false,
+        });
+      }
+
+      const classified = reclassifyStrokes(nextStrokes);
+      recordHistory(classified);
+      setSelectedStrokeId(newId);
+      setBezierDraft([]);
+      setIsNearStart(false);
+    },
+    [strokes, mirrorMode, reclassifyStrokes, recordHistory]
+  );
+
+  // Delete handlers
+  const handleDeleteSelectedStroke = useCallback(() => {
+    if (!selectedStrokeId) return;
+    const updated = strokes.filter((s) => s.id !== selectedStrokeId);
+    recordHistory(reclassifyStrokes(updated));
+    setSelectedStrokeId(null);
+    setSelectedNodeIndex(null);
+  }, [selectedStrokeId, strokes, recordHistory, reclassifyStrokes]);
+
+  const handleDeleteSelectedNode = useCallback(() => {
+    if (!selectedStrokeId || selectedNodeIndex === null) return;
+    const active = strokes.find((s) => s.id === selectedStrokeId);
+    if (!active) return;
+
+    if (active.bezierAnchors) {
+      if (active.bezierAnchors.length <= 2) return;
+      const nextAnchors = active.bezierAnchors.filter((_, idx) => idx !== selectedNodeIndex);
+      const nextPoints = sampleBezierPath(nextAnchors, active.isClosed, 20);
+      const updated = strokes.map((s) =>
+        s.id === selectedStrokeId
+          ? { ...s, bezierAnchors: nextAnchors, points: nextPoints }
+          : s
+      );
+      recordHistory(updated);
+      setSelectedNodeIndex(null);
+      return;
     }
 
-    return [
-      Math.max(0, Math.min(100, pctX)),
-      Math.max(0, Math.min(100, pctY)),
-    ];
-  };
+    if (active.points.length <= 2) return;
+    const nextPoints = active.points.filter((_, idx) => idx !== selectedNodeIndex);
+    const updated = strokes.map((s) =>
+      s.id === selectedStrokeId ? { ...s, points: nextPoints } : s
+    );
+    recordHistory(updated);
+    setSelectedNodeIndex(null);
+  }, [selectedStrokeId, selectedNodeIndex, strokes, recordHistory]);
+
+  // Keyboard shortcuts (V, A, B, P, G, Enter, Esc, Alt, Ctrl+Z, Delete)
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Alt') {
+        isAltPressedRef.current = true;
+      }
+
+      const target = e.target as HTMLElement;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+        if (e.shiftKey) handleRedo();
+        else handleUndo();
+        e.preventDefault();
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
+        handleRedo();
+        e.preventDefault();
+      } else if (e.key === 'v' || e.key === 'V') {
+        setActiveTool('select');
+      } else if (e.key === 'a' || e.key === 'A') {
+        setActiveTool('node');
+      } else if (e.key === 'b' || e.key === 'B') {
+        setActiveTool('bezier');
+      } else if (e.key === 'p' || e.key === 'P') {
+        setActiveTool('pen');
+      } else if (e.key === 'g' || e.key === 'G') {
+        setEnableSnapGrid((prev) => !prev);
+      } else if (e.key === 'Enter' && bezierDraftRef.current.length >= 2) {
+        commitBezierDraft(false);
+        e.preventDefault();
+      } else if (e.key === 'Escape' && bezierDraftRef.current.length > 0) {
+        setBezierDraft([]);
+        setIsNearStart(false);
+        e.preventDefault();
+      } else if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (activeTool === 'node' && selectedStrokeId && selectedNodeIndex !== null) {
+          handleDeleteSelectedNode();
+          e.preventDefault();
+        } else if (selectedStrokeId) {
+          handleDeleteSelectedStroke();
+          e.preventDefault();
+        }
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Alt') {
+        isAltPressedRef.current = false;
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, [
+    isOpen,
+    handleUndo,
+    handleRedo,
+    activeTool,
+    selectedStrokeId,
+    selectedNodeIndex,
+    commitBezierDraft,
+    handleDeleteSelectedNode,
+    handleDeleteSelectedStroke,
+  ]);
+
+  // Coordinate conversion returning both raw and grid-snapped percentage coordinates
+  const getCanvasCoords = useCallback(
+    (
+      e: React.PointerEvent<HTMLCanvasElement> | React.MouseEvent<HTMLCanvasElement>,
+      forceNoSnap: boolean = false
+    ): { raw: Point2D; snapped: Point2D; isSnapped: boolean } => {
+      const canvas = drawCanvasRef.current;
+      if (!canvas) return { raw: [0, 0], snapped: [0, 0], isSnapped: false };
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = canvas.width / rect.width;
+      const scaleY = canvas.height / rect.height;
+
+      const x = (e.clientX - rect.left) * scaleX;
+      const y = (e.clientY - rect.top) * scaleY;
+
+      const rawPctX = Math.max(0, Math.min(100, (x / canvas.width) * 100));
+      const rawPctY = Math.max(0, Math.min(100, (y / canvas.height) * 100));
+      const raw: Point2D = [rawPctX, rawPctY];
+
+      const shouldSnap = enableSnapGrid && !forceNoSnap && !isAltPressedRef.current && !e.altKey;
+      if (shouldSnap) {
+        const snapped = snapToGrid(raw, gridSpacing);
+        return { raw, snapped, isSnapped: true };
+      }
+
+      return { raw, snapped: raw, isSnapped: false };
+    },
+    [enableSnapGrid, gridSpacing]
+  );
 
   // Redraw canvas
   const redrawCanvas = useCallback(() => {
@@ -284,40 +451,72 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
     ctx.fillStyle = '#090d16';
     ctx.fillRect(0, 0, w, h);
 
-    // 2. Millimeter grid
-    if (showGrid) {
+    // 2. Precision Grid & Magnetic Grid Visuals
+    if (showGrid || enableSnapGrid) {
+      const stepPct = gridSpacing;
+      const stepPx = (stepPct / 100) * w;
+
+      // Minor grid lines
       ctx.lineWidth = 1;
-      const step = w / 20;
-      ctx.strokeStyle = '#1e293b40';
+      ctx.strokeStyle = enableSnapGrid ? '#1e293b90' : '#1e293b45';
       ctx.beginPath();
-      for (let x = 0; x <= w; x += step) {
-        ctx.moveTo(x, 0);
-        ctx.lineTo(x, h);
-      }
-      for (let y = 0; y <= h; y += step) {
-        ctx.moveTo(0, y);
-        ctx.lineTo(w, y);
+      for (let p = 0; p <= 100.001; p += stepPct) {
+        const px = (p / 100) * w;
+        ctx.moveTo(px, 0);
+        ctx.lineTo(px, h);
+        ctx.moveTo(0, px);
+        ctx.lineTo(w, px);
       }
       ctx.stroke();
 
-      // Major lines (10% step)
-      ctx.strokeStyle = '#33415560';
+      // Major grid lines (every 10% or 25% depending on spacing)
+      const majorPct = stepPct === 12.5 ? 25 : 10;
+      ctx.strokeStyle = enableSnapGrid ? '#334155b0' : '#33415560';
       ctx.beginPath();
-      for (let x = 0; x <= w; x += step * 2) {
-        ctx.moveTo(x, 0);
-        ctx.lineTo(x, h);
-      }
-      for (let y = 0; y <= h; y += step * 2) {
-        ctx.moveTo(0, y);
-        ctx.lineTo(w, y);
+      for (let p = 0; p <= 100.001; p += majorPct) {
+        const px = (p / 100) * w;
+        ctx.moveTo(px, 0);
+        ctx.lineTo(px, h);
+        ctx.moveTo(0, px);
+        ctx.lineTo(w, px);
       }
       ctx.stroke();
+
+      // Magnetic intersection anchor dots when Magnetic Grid Mode is ON
+      if (enableSnapGrid) {
+        const dotStep = stepPct < 5 ? stepPct * 2 : stepPct;
+        ctx.fillStyle = '#06b6d466';
+        for (let xPct = dotStep; xPct < 100; xPct += dotStep) {
+          for (let yPct = dotStep; yPct < 100; yPct += dotStep) {
+            const gx = (xPct / 100) * w;
+            const gy = (yPct / 100) * h;
+            ctx.fillRect(gx - 1.5, gy - 1.5, 3, 3);
+          }
+        }
+
+        // Crisp CAD border ticks & labels every 10% / 25%
+        ctx.fillStyle = '#64748b';
+        ctx.font = '11px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        for (let p = 10; p < 100; p += 10) {
+          const px = (p / 100) * w;
+          ctx.fillText(`${p}`, px, 4);
+        }
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        for (let p = 10; p < 100; p += 10) {
+          const py = (p / 100) * h;
+          ctx.fillText(`${p}`, 5, py);
+        }
+      }
     }
 
     // 3. Center axes
     if (showCenterGuides) {
       ctx.strokeStyle = '#47556980';
       ctx.setLineDash([4, 4]);
+      ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(w / 2, 0);
       ctx.lineTo(w / 2, h);
@@ -326,8 +525,8 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Safe margin
-      ctx.strokeStyle = '#33415540';
+      // Safe margin box
+      ctx.strokeStyle = '#33415550';
       ctx.setLineDash([2, 4]);
       ctx.strokeRect(w * 0.05, h * 0.05, w * 0.9, h * 0.9);
       ctx.setLineDash([]);
@@ -352,10 +551,11 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
       const isSelected = stroke.id === selectedStrokeId;
       const isOuterBlade = stroke.isOuter;
 
-      ctx.lineWidth = isOuterBlade ? Math.max(3.5, brushSize * 1.1) : Math.max(2, brushSize * 0.75);
+      ctx.lineWidth = isOuterBlade
+        ? Math.max(3.5, brushSize * 1.1)
+        : Math.max(2, brushSize * 0.75);
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
-
       ctx.strokeStyle = isOuterBlade ? '#f59e0b' : '#38bdf8';
 
       if (isOuterBlade) {
@@ -369,19 +569,17 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
       ctx.beginPath();
       const first = stroke.points[0];
       ctx.moveTo((first[0] / 100) * w, (first[1] / 100) * h);
-
       for (let i = 1; i < stroke.points.length; i++) {
         const pt = stroke.points[i];
         ctx.lineTo((pt[0] / 100) * w, (pt[1] / 100) * h);
       }
-
       if (stroke.isClosed) {
         ctx.closePath();
       }
       ctx.stroke();
       ctx.shadowBlur = 0;
 
-      // Selection halo if active
+      // Selection halo
       if (isSelected) {
         ctx.strokeStyle = '#3b82f6';
         ctx.lineWidth = 1.5;
@@ -390,25 +588,98 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
         ctx.setLineDash([]);
       }
 
-      // 6. If in Node Edit Mode ('node') and this shape is selected, draw interactive vertex nodes (Inkscape / Illustrator style)
+      // 6. Render Nodes & Bézier Tangent Handles in Node Tool ('node')
       if (activeTool === 'node' && isSelected) {
-        stroke.points.forEach((pt, nIdx) => {
-          const isNodeSelected = nIdx === selectedNodeIndex;
-          const nx = (pt[0] / 100) * w;
-          const ny = (pt[1] / 100) * h;
+        if (stroke.bezierAnchors && stroke.bezierAnchors.length > 0) {
+          stroke.bezierAnchors.forEach((anc, idx) => {
+            const isNodeSelected = idx === selectedNodeIndex;
+            const ax = (anc.pos[0] / 100) * w;
+            const ay = (anc.pos[1] / 100) * h;
 
-          // Draw vertex square node
-          const nodeSize = isNodeSelected ? 9 : 7;
-          ctx.fillStyle = isNodeSelected ? '#3b82f6' : '#ffffff';
-          ctx.strokeStyle = '#1e293b';
-          ctx.lineWidth = 1.5;
-          ctx.fillRect(nx - nodeSize / 2, ny - nodeSize / 2, nodeSize, nodeSize);
-          ctx.strokeRect(nx - nodeSize / 2, ny - nodeSize / 2, nodeSize, nodeSize);
-        });
+            // Draw tangent arms & handles for selected node or adjacent nodes
+            const showHandles =
+              isNodeSelected ||
+              selectedNodeIndex === null ||
+              Math.abs(idx - selectedNodeIndex) <= 1;
+
+            if (showHandles) {
+              ctx.strokeStyle = isNodeSelected ? '#38bdf8' : '#64748b80';
+              ctx.lineWidth = 1.25;
+
+              if (anc.handleIn) {
+                const hx = (anc.handleIn[0] / 100) * w;
+                const hy = (anc.handleIn[1] / 100) * h;
+                ctx.beginPath();
+                ctx.moveTo(ax, ay);
+                ctx.lineTo(hx, hy);
+                ctx.stroke();
+
+                ctx.fillStyle = isNodeSelected ? '#22d3ee' : '#94a3b8';
+                ctx.strokeStyle = '#0f172a';
+                ctx.beginPath();
+                ctx.arc(hx, hy, isNodeSelected ? 5.5 : 4, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+              }
+
+              if (anc.handleOut) {
+                const hx = (anc.handleOut[0] / 100) * w;
+                const hy = (anc.handleOut[1] / 100) * h;
+                ctx.strokeStyle = isNodeSelected ? '#38bdf8' : '#64748b80';
+                ctx.beginPath();
+                ctx.moveTo(ax, ay);
+                ctx.lineTo(hx, hy);
+                ctx.stroke();
+
+                ctx.fillStyle = isNodeSelected ? '#f59e0b' : '#94a3b8';
+                ctx.strokeStyle = '#0f172a';
+                ctx.beginPath();
+                ctx.arc(hx, hy, isNodeSelected ? 5.5 : 4, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+              }
+            }
+
+            // Draw Anchor Node (diamond for corner, circle for smooth/symmetric)
+            const size = isNodeSelected ? 6 : 4.5;
+            ctx.fillStyle = isNodeSelected ? '#3b82f6' : '#ffffff';
+            ctx.strokeStyle = '#0f172a';
+            ctx.lineWidth = 1.5;
+
+            if (anc.mode === 'corner') {
+              ctx.beginPath();
+              ctx.moveTo(ax, ay - size);
+              ctx.lineTo(ax + size, ay);
+              ctx.lineTo(ax, ay + size);
+              ctx.lineTo(ax - size, ay);
+              ctx.closePath();
+              ctx.fill();
+              ctx.stroke();
+            } else {
+              ctx.beginPath();
+              ctx.arc(ax, ay, size, 0, Math.PI * 2);
+              ctx.fill();
+              ctx.stroke();
+            }
+          });
+        } else {
+          // Standard polyline vertex squares
+          stroke.points.forEach((pt, nIdx) => {
+            const isNodeSelected = nIdx === selectedNodeIndex;
+            const nx = (pt[0] / 100) * w;
+            const ny = (pt[1] / 100) * h;
+            const nodeSize = isNodeSelected ? 9 : 7;
+            ctx.fillStyle = isNodeSelected ? '#3b82f6' : '#ffffff';
+            ctx.strokeStyle = '#1e293b';
+            ctx.lineWidth = 1.5;
+            ctx.fillRect(nx - nodeSize / 2, ny - nodeSize / 2, nodeSize, nodeSize);
+            ctx.strokeRect(nx - nodeSize / 2, ny - nodeSize / 2, nodeSize, nodeSize);
+          });
+        }
       }
     });
 
-    // 7. If in Selection / Transform Mode ('select') and a stroke is selected, draw Illustrator Bounding Box with transform handles
+    // 7. Bounding Box in Selection Mode ('select')
     const activeStroke = strokes.find((s) => s.id === selectedStrokeId);
     if (activeTool === 'select' && activeStroke && activeStroke.points.length > 0) {
       const b = getPathBounds(activeStroke.points);
@@ -417,24 +688,22 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
       const bw = (b.width / 100) * w;
       const bh = (b.height / 100) * h;
 
-      // Draw bounding rectangle
       ctx.strokeStyle = '#3b82f6';
       ctx.lineWidth = 1.2;
       ctx.setLineDash([3, 3]);
       ctx.strokeRect(bx, by, bw, bh);
       ctx.setLineDash([]);
 
-      // Draw 8 resize handles
       const handleSize = 7;
       const handles = [
-        { id: 'tl', x: bx, y: by },
-        { id: 'tm', x: bx + bw / 2, y: by },
-        { id: 'tr', x: bx + bw, y: by },
-        { id: 'ml', x: bx, y: by + bh / 2 },
-        { id: 'mr', x: bx + bw, y: by + bh / 2 },
-        { id: 'bl', x: bx, y: by + bh },
-        { id: 'bm', x: bx + bw / 2, y: by + bh },
-        { id: 'br', x: bx + bw, y: by + bh },
+        { x: bx, y: by },
+        { x: bx + bw / 2, y: by },
+        { x: bx + bw, y: by },
+        { x: bx, y: by + bh / 2 },
+        { x: bx + bw, y: by + bh / 2 },
+        { x: bx, y: by + bh },
+        { x: bx + bw / 2, y: by + bh },
+        { x: bx + bw, y: by + bh },
       ];
 
       handles.forEach((hnd) => {
@@ -445,7 +714,6 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
         ctx.strokeRect(hnd.x - handleSize / 2, hnd.y - handleSize / 2, handleSize, handleSize);
       });
 
-      // Rotation lever above top center
       const rotY = by - 20;
       ctx.strokeStyle = '#3b82f6';
       ctx.lineWidth = 1;
@@ -462,7 +730,97 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
       ctx.stroke();
     }
 
-    // 8. Active drawing in progress
+    // 8. Active Bézier Draft Construction Preview
+    if (bezierDraft.length > 0) {
+      // Draw committed segments of draft
+      const sampledDraft = sampleBezierPath(bezierDraft, false, 20);
+      if (sampledDraft.length >= 2) {
+        ctx.strokeStyle = '#22d3ee';
+        ctx.lineWidth = Math.max(2.5, brushSize * 0.9);
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.beginPath();
+        ctx.moveTo((sampledDraft[0][0] / 100) * w, (sampledDraft[0][1] / 100) * h);
+        for (let i = 1; i < sampledDraft.length; i++) {
+          ctx.lineTo((sampledDraft[i][0] / 100) * w, (sampledDraft[i][1] / 100) * h);
+        }
+        ctx.stroke();
+      }
+
+      // Live rubber-band preview curve to cursor when not actively dragging handle
+      const lastAnc = bezierDraft[bezierDraft.length - 1];
+      if (cursorPos && !isDraggingBezierHandleRef.current) {
+        const cp1 = lastAnc.handleOut || lastAnc.pos;
+        const cp2 = cursorPos;
+        ctx.strokeStyle = '#38bdf880';
+        ctx.lineWidth = 1.8;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo((lastAnc.pos[0] / 100) * w, (lastAnc.pos[1] / 100) * h);
+        for (let s = 1; s <= 16; s++) {
+          const pt = evaluateCubicBezier(lastAnc.pos, cp1, cp2, cursorPos, s / 16);
+          ctx.lineTo((pt[0] / 100) * w, (pt[1] / 100) * h);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+
+      // Draw anchor nodes and handle arms of draft
+      bezierDraft.forEach((anc, i) => {
+        const ax = (anc.pos[0] / 100) * w;
+        const ay = (anc.pos[1] / 100) * h;
+
+        if (anc.handleIn) {
+          const hx = (anc.handleIn[0] / 100) * w;
+          const hy = (anc.handleIn[1] / 100) * h;
+          ctx.strokeStyle = '#38bdf8';
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          ctx.moveTo(ax, ay);
+          ctx.lineTo(hx, hy);
+          ctx.stroke();
+          ctx.fillStyle = '#22d3ee';
+          ctx.beginPath();
+          ctx.arc(hx, hy, 4.5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        if (anc.handleOut) {
+          const hx = (anc.handleOut[0] / 100) * w;
+          const hy = (anc.handleOut[1] / 100) * h;
+          ctx.strokeStyle = '#f59e0b';
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          ctx.moveTo(ax, ay);
+          ctx.lineTo(hx, hy);
+          ctx.stroke();
+          ctx.fillStyle = '#fbbf24';
+          ctx.beginPath();
+          ctx.arc(hx, hy, 4.5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        // First anchor highlights green when closing loop
+        if (i === 0 && isNearStart && bezierDraft.length >= 2) {
+          ctx.strokeStyle = '#22c55e';
+          ctx.lineWidth = 2.5;
+          ctx.beginPath();
+          ctx.arc(ax, ay, 12, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.fillStyle = '#22c55e';
+          ctx.beginPath();
+          ctx.arc(ax, ay, 5.5, 0, Math.PI * 2);
+          ctx.fill();
+        } else {
+          ctx.fillStyle = i === bezierDraft.length - 1 ? '#f59e0b' : '#ffffff';
+          ctx.strokeStyle = '#0f172a';
+          ctx.lineWidth = 1.5;
+          ctx.fillRect(ax - 4.5, ay - 4.5, 9, 9);
+          ctx.strokeRect(ax - 4.5, ay - 4.5, 9, 9);
+        }
+      });
+    }
+
+    // 9. Active freehand / shape drawing in progress
     if (currentRawPointsRef.current.length > 0) {
       const pts = currentRawPointsRef.current;
       ctx.lineWidth = brushSize;
@@ -491,7 +849,6 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
       }
       ctx.shadowBlur = 0;
 
-      // Magnetic snap indicator
       const startPt = pts[0];
       const startX = (startPt[0] / 100) * w;
       const startY = (startPt[1] / 100) * h;
@@ -502,7 +859,6 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
         ctx.beginPath();
         ctx.arc(startX, startY, 12, 0, Math.PI * 2);
         ctx.stroke();
-
         ctx.fillStyle = '#22c55e';
         ctx.beginPath();
         ctx.arc(startX, startY, 5, 0, Math.PI * 2);
@@ -514,8 +870,60 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
         ctx.fill();
       }
     }
+
+    // 10. Visual Magnetic Grid Snap Reticle & Alignment Hairlines
+    if (enableSnapGrid && cursorPos && activeTool !== 'eraser') {
+      const sx = (cursorPos[0] / 100) * w;
+      const sy = (cursorPos[1] / 100) * h;
+
+      // Full-canvas faint magnetic alignment hairlines
+      ctx.strokeStyle = '#06b6d438';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 5]);
+      ctx.beginPath();
+      ctx.moveTo(sx, 0);
+      ctx.lineTo(sx, h);
+      ctx.moveTo(0, sy);
+      ctx.lineTo(w, sy);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Magnetic tether line from raw pointer to snapped grid vertex
+      if (rawCursorPos) {
+        const rx = (rawCursorPos[0] / 100) * w;
+        const ry = (rawCursorPos[1] / 100) * h;
+        if (Math.hypot(rx - sx, ry - sy) > 2) {
+          ctx.strokeStyle = '#10b98180';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([2, 2]);
+          ctx.beginPath();
+          ctx.moveTo(rx, ry);
+          ctx.lineTo(sx, sy);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+      }
+
+      // Snapped target diamond + ring
+      ctx.strokeStyle = '#10b981';
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.arc(sx, sy, 8, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.fillStyle = '#34d399';
+      ctx.beginPath();
+      ctx.moveTo(sx, sy - 4);
+      ctx.lineTo(sx + 4, sy);
+      ctx.lineTo(sx, sy + 4);
+      ctx.lineTo(sx - 4, sy);
+      ctx.closePath();
+      ctx.fill();
+    }
   }, [
     showGrid,
+    enableSnapGrid,
+    gridSpacing,
     showCenterGuides,
     mirrorMode,
     brushSize,
@@ -524,52 +932,137 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
     selectedNodeIndex,
     activeTool,
     isNearStart,
+    bezierDraft,
+    cursorPos,
+    rawCursorPos,
   ]);
 
   useEffect(() => {
     redrawCanvas();
   }, [redrawCanvas]);
 
-  // Pointer interactions for drawing, node editing, selection and transforms
+  // Pointer interactions
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = drawCanvasRef.current;
     if (!canvas) return;
     canvas.setPointerCapture(e.pointerId);
 
-    const pt = getCanvasPoint(e);
+    const { raw, snapped } = getCanvasCoords(e);
+    // Freehand pen keeps smooth continuous raw input (but snaps start/end if Magnetic Grid is on)
+    const pt = activeTool === 'pen' ? raw : snapped;
+
     isPointerDownRef.current = true;
     startDragPtRef.current = pt;
     setIsNearStart(false);
 
-    // MODE 1: Node Tool (Direct Selection / Vértices)
+    // MODE 0: Cubic Bézier Pen Tool (B)
+    if (activeTool === 'bezier') {
+      const draft = bezierDraftRef.current;
+
+      // Check if clicking the start anchor to close the path
+      if (draft.length >= 2 && distance(snapped, draft[0].pos) <= Math.max(3.5, gridSpacing * 0.6)) {
+        bezierClosingDragRef.current = true;
+        isDraggingBezierHandleRef.current = true;
+        redrawCanvas();
+        return;
+      }
+
+      // Otherwise add a new anchor point at snapped coordinates
+      const newAnchor: BezierAnchor = {
+        pos: snapped,
+        handleIn: null,
+        handleOut: null,
+        mode: 'symmetric',
+      };
+      setBezierDraft([...draft, newAnchor]);
+      isDraggingBezierHandleRef.current = true;
+      bezierClosingDragRef.current = false;
+      redrawCanvas();
+      return;
+    }
+
+    // MODE 1: Node & Bézier Handle Tool (A)
     if (activeTool === 'node') {
       const activeStroke = strokes.find((s) => s.id === selectedStrokeId);
       if (activeStroke) {
-        // Check if clicked an existing node
-        const nodeIdx = activeStroke.points.findIndex((p) => distance(p, pt) <= 3);
-        if (nodeIdx !== -1) {
-          setSelectedNodeIndex(nodeIdx);
-          dragModeRef.current = 'move-node';
-          originalPointsRef.current = [...activeStroke.points];
-          redrawCanvas();
-          return;
-        }
+        if (activeStroke.bezierAnchors && activeStroke.bezierAnchors.length > 0) {
+          // 1a. Check if clicking any handleIn or handleOut first
+          for (let i = 0; i < activeStroke.bezierAnchors.length; i++) {
+            const anc = activeStroke.bezierAnchors[i];
+            if (anc.handleIn && distance(raw, anc.handleIn) <= 2.8) {
+              setSelectedNodeIndex(i);
+              dragModeRef.current = 'move-handle-in';
+              originalAnchorsRef.current = activeStroke.bezierAnchors;
+              redrawCanvas();
+              return;
+            }
+            if (anc.handleOut && distance(raw, anc.handleOut) <= 2.8) {
+              setSelectedNodeIndex(i);
+              dragModeRef.current = 'move-handle-out';
+              originalAnchorsRef.current = activeStroke.bezierAnchors;
+              redrawCanvas();
+              return;
+            }
+          }
 
-        // Check if clicked along path to insert a new node!
-        const insertResult = insertNodeOnPath(activeStroke.points, pt);
-        if (insertResult) {
-          const updated = strokes.map((s) => (s.id === activeStroke.id ? { ...s, points: insertResult.points } : s));
-          recordHistory(updated);
-          setSelectedNodeIndex(insertResult.index);
-          dragModeRef.current = 'move-node';
-          originalPointsRef.current = [...insertResult.points];
-          redrawCanvas();
-          return;
+          // 1b. Check if clicking an anchor node
+          const ancIdx = activeStroke.bezierAnchors.findIndex((a) => distance(raw, a.pos) <= 3.2);
+          if (ancIdx !== -1) {
+            setSelectedNodeIndex(ancIdx);
+            dragModeRef.current = 'move-node';
+            originalAnchorsRef.current = activeStroke.bezierAnchors;
+            redrawCanvas();
+            return;
+          }
+
+          // 1c. Check if clicking along a Bézier curve segment to insert a split node
+          const splitResult = insertBezierAnchorOnSegment(
+            activeStroke.bezierAnchors,
+            activeStroke.isClosed,
+            raw
+          );
+          if (splitResult) {
+            const sampled = sampleBezierPath(splitResult.anchors, activeStroke.isClosed, 20);
+            const updated = strokes.map((s) =>
+              s.id === activeStroke.id
+                ? { ...s, bezierAnchors: splitResult.anchors, points: sampled }
+                : s
+            );
+            recordHistory(updated);
+            setSelectedNodeIndex(splitResult.index);
+            dragModeRef.current = 'move-node';
+            originalAnchorsRef.current = splitResult.anchors;
+            redrawCanvas();
+            return;
+          }
+        } else {
+          // Polyline node hit test
+          const nodeIdx = activeStroke.points.findIndex((p) => distance(raw, p) <= 3.2);
+          if (nodeIdx !== -1) {
+            setSelectedNodeIndex(nodeIdx);
+            dragModeRef.current = 'move-node';
+            originalPointsRef.current = [...activeStroke.points];
+            redrawCanvas();
+            return;
+          }
+
+          const insertResult = insertNodeOnPath(activeStroke.points, raw);
+          if (insertResult) {
+            const updated = strokes.map((s) =>
+              s.id === activeStroke.id ? { ...s, points: insertResult.points } : s
+            );
+            recordHistory(updated);
+            setSelectedNodeIndex(insertResult.index);
+            dragModeRef.current = 'move-node';
+            originalPointsRef.current = [...insertResult.points];
+            redrawCanvas();
+            return;
+          }
         }
       }
 
-      // Otherwise, see if clicked another stroke to select it
-      const clickedStroke = strokes.find((s) => s.points.some((p) => distance(p, pt) <= 4));
+      // Click another stroke to select it
+      const clickedStroke = strokes.find((s) => s.points.some((p) => distance(raw, p) <= 4));
       if (clickedStroke) {
         setSelectedStrokeId(clickedStroke.id);
         setSelectedNodeIndex(null);
@@ -586,46 +1079,46 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
       const activeStroke = strokes.find((s) => s.id === selectedStrokeId);
       if (activeStroke) {
         const b = getPathBounds(activeStroke.points);
-        // Check rotate handle (above top center)
         const rotPt: Point2D = [b.centerX, b.minY - 3];
-        if (distance(pt, rotPt) <= 4) {
+        if (distance(raw, rotPt) <= 4) {
           dragModeRef.current = 'rotate-handle';
           originalPointsRef.current = [...activeStroke.points];
+          originalAnchorsRef.current = activeStroke.bezierAnchors;
           redrawCanvas();
           return;
         }
 
-        // Check scale handles
         const handles: { id: string; p: Point2D }[] = [
           { id: 'tl', p: [b.minX, b.minY] },
           { id: 'tr', p: [b.maxX, b.minY] },
           { id: 'bl', p: [b.minX, b.maxY] },
           { id: 'br', p: [b.maxX, b.maxY] },
         ];
-        const hMatch = handles.find((h) => distance(pt, h.p) <= 3.5);
+        const hMatch = handles.find((h) => distance(raw, h.p) <= 3.5);
         if (hMatch) {
           dragModeRef.current = 'scale-handle';
           activeHandleRef.current = hMatch.id;
           originalPointsRef.current = [...activeStroke.points];
+          originalAnchorsRef.current = activeStroke.bezierAnchors;
           redrawCanvas();
           return;
         }
 
-        // Check if clicking inside bounding box to move
-        if (pt[0] >= b.minX && pt[0] <= b.maxX && pt[1] >= b.minY && pt[1] <= b.maxY) {
+        if (raw[0] >= b.minX && raw[0] <= b.maxX && raw[1] >= b.minY && raw[1] <= b.maxY) {
           dragModeRef.current = 'move-shape';
           originalPointsRef.current = [...activeStroke.points];
+          originalAnchorsRef.current = activeStroke.bezierAnchors;
           redrawCanvas();
           return;
         }
       }
 
-      // Check if clicking another stroke
-      const clickedStroke = strokes.find((s) => s.points.some((p) => distance(p, pt) <= 4));
+      const clickedStroke = strokes.find((s) => s.points.some((p) => distance(raw, p) <= 4));
       if (clickedStroke) {
         setSelectedStrokeId(clickedStroke.id);
         dragModeRef.current = 'move-shape';
         originalPointsRef.current = [...clickedStroke.points];
+        originalAnchorsRef.current = clickedStroke.bezierAnchors;
       } else {
         setSelectedStrokeId(null);
         dragModeRef.current = 'none';
@@ -636,7 +1129,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
 
     // MODE 3: Eraser
     if (activeTool === 'eraser') {
-      const clickedIdx = strokes.findIndex((st) => st.points.some((p) => distance(p, pt) <= 4));
+      const clickedIdx = strokes.findIndex((st) => st.points.some((p) => distance(raw, p) <= 4));
       if (clickedIdx !== -1) {
         const next = strokes.filter((_, i) => i !== clickedIdx);
         recordHistory(reclassifyStrokes(next));
@@ -649,24 +1142,115 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
 
     // MODE 4: Drawing tools (Pen, Line, Shapes)
     dragModeRef.current = 'draw';
-    stabilizerRef.current.reset(pt[0], pt[1]);
-    currentRawPointsRef.current = [pt];
+    const initialPt = activeTool === 'pen' && enableSnapGrid ? snapped : pt;
+    stabilizerRef.current.reset(initialPt[0], initialPt[1]);
+    currentRawPointsRef.current = [initialPt];
     redrawCanvas();
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    const pt = getCanvasPoint(e);
-    setCursorPos(pt);
+    const { raw, snapped } = getCanvasCoords(e);
+    setRawCursorPos(raw);
+    setCursorPos(snapped);
 
-    if (!isPointerDownRef.current) return;
+    // Hover feedback for closing Bézier draft loop
+    if (activeTool === 'bezier' && !isPointerDownRef.current && bezierDraftRef.current.length >= 2) {
+      const startPos = bezierDraftRef.current[0].pos;
+      setIsNearStart(distance(snapped, startPos) <= Math.max(3.5, gridSpacing * 0.6));
+      redrawCanvas();
+      return;
+    }
+
+    if (!isPointerDownRef.current) {
+      if (enableSnapGrid) redrawCanvas();
+      return;
+    }
+
+    // Dragging Bézier handles while placing anchor in Bézier Pen Tool
+    if (activeTool === 'bezier' && isDraggingBezierHandleRef.current) {
+      const draft = bezierDraftRef.current;
+      if (draft.length === 0) return;
+
+      if (bezierClosingDragRef.current) {
+        // Adjust closing anchor handles (anchor 0)
+        const anc0 = draft[0];
+        const dx = snapped[0] - anc0.pos[0];
+        const dy = snapped[1] - anc0.pos[1];
+        if (Math.hypot(dx, dy) > 0.6) {
+          const updated0: BezierAnchor = {
+            ...anc0,
+            mode: 'symmetric',
+            handleOut: snapped,
+            handleIn: [
+              Math.max(0, Math.min(100, anc0.pos[0] - dx)),
+              Math.max(0, Math.min(100, anc0.pos[1] - dy)),
+            ],
+          };
+          setBezierDraft([updated0, ...draft.slice(1)]);
+        }
+      } else {
+        const lastIdx = draft.length - 1;
+        const lastAnc = draft[lastIdx];
+        const dx = snapped[0] - lastAnc.pos[0];
+        const dy = snapped[1] - lastAnc.pos[1];
+        if (Math.hypot(dx, dy) > 0.6) {
+          const updatedLast: BezierAnchor = {
+            ...lastAnc,
+            mode: 'symmetric',
+            handleOut: snapped,
+            handleIn: [
+              Math.max(0, Math.min(100, lastAnc.pos[0] - dx)),
+              Math.max(0, Math.min(100, lastAnc.pos[1] - dy)),
+            ],
+          };
+          setBezierDraft([...draft.slice(0, lastIdx), updatedLast]);
+        }
+      }
+      redrawCanvas();
+      return;
+    }
+
+    // Dragging Bézier tangent handleIn / handleOut in Node Mode
+    if (
+      (dragModeRef.current === 'move-handle-in' || dragModeRef.current === 'move-handle-out') &&
+      selectedStrokeId &&
+      selectedNodeIndex !== null
+    ) {
+      const which = dragModeRef.current === 'move-handle-in' ? 'in' : 'out';
+      setStrokes((prev) =>
+        prev.map((s) => {
+          if (s.id !== selectedStrokeId || !s.bezierAnchors) return s;
+          const nextAnchors = s.bezierAnchors.map((anc, idx) =>
+            idx === selectedNodeIndex ? updateAnchorHandle(anc, which, snapped) : anc
+          );
+          return {
+            ...s,
+            bezierAnchors: nextAnchors,
+            points: sampleBezierPath(nextAnchors, s.isClosed, 20),
+          };
+        })
+      );
+      redrawCanvas();
+      return;
+    }
 
     // Moving a single node in Node Mode
     if (dragModeRef.current === 'move-node' && selectedStrokeId && selectedNodeIndex !== null) {
       setStrokes((prev) =>
         prev.map((s) => {
           if (s.id !== selectedStrokeId) return s;
+          if (s.bezierAnchors) {
+            const nextAnchors = s.bezierAnchors.map((anc, idx) =>
+              idx === selectedNodeIndex ? moveBezierAnchor(anc, snapped) : anc
+            );
+            return {
+              ...s,
+              bezierAnchors: nextAnchors,
+              points: sampleBezierPath(nextAnchors, s.isClosed, 20),
+            };
+          }
           const nextPts = [...s.points];
-          nextPts[selectedNodeIndex] = pt;
+          nextPts[selectedNodeIndex] = snapped;
           return { ...s, points: nextPts };
         })
       );
@@ -676,10 +1260,23 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
 
     // Moving entire shape in Select Mode
     if (dragModeRef.current === 'move-shape' && selectedStrokeId && startDragPtRef.current) {
-      const dx = pt[0] - startDragPtRef.current[0];
-      const dy = pt[1] - startDragPtRef.current[1];
-      const moved = translatePath(originalPointsRef.current, dx, dy);
-      setStrokes((prev) => prev.map((s) => (s.id === selectedStrokeId ? { ...s, points: moved } : s)));
+      const dx = snapped[0] - startDragPtRef.current[0];
+      const dy = snapped[1] - startDragPtRef.current[1];
+      const movedPts = translatePath(originalPointsRef.current, dx, dy);
+      const movedAnchors = originalAnchorsRef.current
+        ? transformBezierAnchors(originalAnchorsRef.current, ([x, y]) => [
+            Math.max(0, Math.min(100, x + dx)),
+            Math.max(0, Math.min(100, y + dy)),
+          ])
+        : undefined;
+
+      setStrokes((prev) =>
+        prev.map((s) =>
+          s.id === selectedStrokeId
+            ? { ...s, points: movedPts, bezierAnchors: movedAnchors }
+            : s
+        )
+      );
       redrawCanvas();
       return;
     }
@@ -689,8 +1286,8 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
       const origBounds = getPathBounds(originalPointsRef.current);
       const startW = origBounds.width || 1;
       const startH = origBounds.height || 1;
-      const dx = pt[0] - startDragPtRef.current[0];
-      const dy = pt[1] - startDragPtRef.current[1];
+      const dx = snapped[0] - startDragPtRef.current[0];
+      const dy = snapped[1] - startDragPtRef.current[1];
 
       let scaleFactorX = 1;
       let scaleFactorY = 1;
@@ -709,8 +1306,22 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
         scaleFactorY = Math.max(0.2, (startH + dy) / startH);
       }
 
-      const scaled = scalePath(originalPointsRef.current, scaleFactorX, scaleFactorY, [origBounds.centerX, origBounds.centerY]);
-      setStrokes((prev) => prev.map((s) => (s.id === selectedStrokeId ? { ...s, points: scaled } : s)));
+      const origin: Point2D = [origBounds.centerX, origBounds.centerY];
+      const scaledPts = scalePath(originalPointsRef.current, scaleFactorX, scaleFactorY, origin);
+      const scaledAnchors = originalAnchorsRef.current
+        ? transformBezierAnchors(originalAnchorsRef.current, ([x, y]) => [
+            Math.max(0, Math.min(100, origin[0] + (x - origin[0]) * scaleFactorX)),
+            Math.max(0, Math.min(100, origin[1] + (y - origin[1]) * scaleFactorY)),
+          ])
+        : undefined;
+
+      setStrokes((prev) =>
+        prev.map((s) =>
+          s.id === selectedStrokeId
+            ? { ...s, points: scaledPts, bezierAnchors: scaledAnchors }
+            : s
+        )
+      );
       redrawCanvas();
       return;
     }
@@ -718,9 +1329,27 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
     // Rotating shape via lever
     if (dragModeRef.current === 'rotate-handle' && selectedStrokeId) {
       const origBounds = getPathBounds(originalPointsRef.current);
-      const angle = (Math.atan2(pt[1] - origBounds.centerY, pt[0] - origBounds.centerX) * 180) / Math.PI + 90;
-      const rotated = rotatePath(originalPointsRef.current, angle, [origBounds.centerX, origBounds.centerY]);
-      setStrokes((prev) => prev.map((s) => (s.id === selectedStrokeId ? { ...s, points: rotated } : s)));
+      const angle =
+        (Math.atan2(snapped[1] - origBounds.centerY, snapped[0] - origBounds.centerX) * 180) /
+          Math.PI +
+        90;
+      const origin: Point2D = [origBounds.centerX, origBounds.centerY];
+      const angleRad = (angle * Math.PI) / 180;
+      const rotatedPts = rotatePath(originalPointsRef.current, angle, origin);
+      const rotatedAnchors = originalAnchorsRef.current
+        ? transformBezierAnchors(originalAnchorsRef.current, (p) => {
+            const r = rotatePoint(p, origin, angleRad);
+            return [Math.max(0, Math.min(100, r[0])), Math.max(0, Math.min(100, r[1]))];
+          })
+        : undefined;
+
+      setStrokes((prev) =>
+        prev.map((s) =>
+          s.id === selectedStrokeId
+            ? { ...s, points: rotatedPts, bezierAnchors: rotatedAnchors }
+            : s
+        )
+      );
       redrawCanvas();
       return;
     }
@@ -728,7 +1357,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
     // Active stroke drawing
     if (dragModeRef.current === 'draw') {
       if (activeTool === 'pen') {
-        const [filteredX, filteredY] = stabilizerRef.current.filter(pt[0], pt[1]);
+        const [filteredX, filteredY] = stabilizerRef.current.filter(raw[0], raw[1]);
         const currentFiltered: Point2D = [filteredX, filteredY];
         const lastPt = currentRawPointsRef.current[currentRawPointsRef.current.length - 1];
 
@@ -742,21 +1371,26 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
         }
       } else if (activeTool === 'line') {
         if (startDragPtRef.current) {
-          currentRawPointsRef.current = [startDragPtRef.current, pt];
+          currentRawPointsRef.current = [startDragPtRef.current, snapped];
         }
       } else if (activeTool === 'circle') {
         if (startDragPtRef.current) {
           const center = startDragPtRef.current;
-          currentRawPointsRef.current = generateEllipse(center, Math.abs(pt[0] - center[0]), Math.abs(pt[1] - center[1]), 48);
+          currentRawPointsRef.current = generateEllipse(
+            center,
+            Math.abs(snapped[0] - center[0]),
+            Math.abs(snapped[1] - center[1]),
+            48
+          );
         }
       } else if (activeTool === 'rect') {
         if (startDragPtRef.current) {
-          currentRawPointsRef.current = generateRectangle(startDragPtRef.current, pt, 2);
+          currentRawPointsRef.current = generateRectangle(startDragPtRef.current, snapped, 2);
         }
       } else if (activeTool === 'star') {
         if (startDragPtRef.current) {
           const center = startDragPtRef.current;
-          const radius = distance(center, pt);
+          const radius = distance(center, snapped);
           const starPts: Point2D[] = [];
           for (let i = 0; i < 10; i++) {
             const r = i % 2 === 0 ? radius : radius * 0.45;
@@ -769,11 +1403,16 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
       } else if (activeTool === 'heart') {
         if (startDragPtRef.current) {
           const center = startDragPtRef.current;
-          const radius = distance(center, pt);
+          const radius = distance(center, snapped);
           const heartPts: Point2D[] = [];
           for (let t = 0; t <= Math.PI * 2; t += 0.15) {
             const x = 16 * Math.pow(Math.sin(t), 3);
-            const y = -(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t));
+            const y = -(
+              13 * Math.cos(t) -
+              5 * Math.cos(2 * t) -
+              2 * Math.cos(3 * t) -
+              Math.cos(4 * t)
+            );
             heartPts.push([center[0] + (x / 18) * radius, center[1] + (y / 18) * radius]);
           }
           heartPts.push([heartPts[0][0], heartPts[0][1]]);
@@ -790,9 +1429,27 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
       canvas.releasePointerCapture(e.pointerId);
     }
     isPointerDownRef.current = false;
+
+    // Finish Bézier anchor placement / handle drag
+    if (activeTool === 'bezier') {
+      isDraggingBezierHandleRef.current = false;
+      if (bezierClosingDragRef.current) {
+        bezierClosingDragRef.current = false;
+        commitBezierDraft(true);
+      }
+      return;
+    }
+
     setIsNearStart(false);
 
-    if (dragModeRef.current === 'move-shape' || dragModeRef.current === 'scale-handle' || dragModeRef.current === 'rotate-handle' || dragModeRef.current === 'move-node') {
+    if (
+      dragModeRef.current === 'move-shape' ||
+      dragModeRef.current === 'scale-handle' ||
+      dragModeRef.current === 'rotate-handle' ||
+      dragModeRef.current === 'move-node' ||
+      dragModeRef.current === 'move-handle-in' ||
+      dragModeRef.current === 'move-handle-out'
+    ) {
       recordHistory([...strokes]);
       dragModeRef.current = 'none';
       return;
@@ -808,14 +1465,27 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
       }
 
       let closed = false;
-      if (activeTool === 'circle' || activeTool === 'rect' || activeTool === 'star' || activeTool === 'heart') {
+      if (
+        activeTool === 'circle' ||
+        activeTool === 'rect' ||
+        activeTool === 'star' ||
+        activeTool === 'heart'
+      ) {
         closed = true;
       } else if (activeTool === 'pen') {
         if (autoCloseLoop && isLoopClosed(finalPoints, 7)) {
           finalPoints = closeLoop(finalPoints);
           closed = true;
+        } else if (enableSnapGrid) {
+          // Snap endpoint to magnetic grid if not closing loop
+          finalPoints[finalPoints.length - 1] = snapToGrid(
+            finalPoints[finalPoints.length - 1],
+            gridSpacing
+          );
         }
       }
+
+      let generatedAnchors: BezierAnchor[] | undefined = undefined;
 
       if (activeTool === 'pen') {
         const eps = smoothingLevel === 'high' ? 0.9 : smoothingLevel === 'medium' ? 0.5 : 0.2;
@@ -825,13 +1495,20 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
         } else if (smoothingLevel === 'high') {
           clean = catmullRomSpline(clean, 3, closed);
         }
-        finalPoints = clean;
+
+        if (autoBezierFreehand && clean.length >= 3) {
+          generatedAnchors = polylineToBezierAnchors(clean, closed, 1.5);
+          finalPoints = sampleBezierPath(generatedAnchors, closed, 18);
+        } else {
+          finalPoints = clean;
+        }
       }
 
       const newId = `stroke_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
       const newStroke: StrokeItem = {
         id: newId,
         points: finalPoints,
+        bezierAnchors: generatedAnchors,
         isClosed: closed,
         isOuter: false,
       };
@@ -843,9 +1520,16 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
           Math.max(0, Math.min(100, 100 - x)),
           y,
         ]);
+        const mirroredAnchors = generatedAnchors
+          ? transformBezierAnchors(generatedAnchors, ([x, y]) => [
+              Math.max(0, Math.min(100, 100 - x)),
+              y,
+            ])
+          : undefined;
         newStrokes.push({
           id: `stroke_mirror_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
           points: mirroredPts,
+          bezierAnchors: mirroredAnchors,
           isClosed: closed,
           isOuter: false,
         });
@@ -860,12 +1544,86 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
     }
   };
 
-  // Vector Transformation Operations (Illustrator / Inkscape feature set)
+  // Double-click finishes open Bézier path
+  const handleDoubleClick = () => {
+    if (activeTool === 'bezier' && bezierDraftRef.current.length >= 2) {
+      commitBezierDraft(false);
+    }
+  };
+
+  // Convert selected stroke into editable Bézier anchors
+  const handleConvertSelectedToBezier = () => {
+    if (!selectedStrokeId) return;
+    const target = strokes.find((s) => s.id === selectedStrokeId);
+    if (!target || target.bezierAnchors) return;
+
+    const anchors = polylineToBezierAnchors(target.points, target.isClosed, 1.3);
+    const sampled = sampleBezierPath(anchors, target.isClosed, 20);
+    const updated = strokes.map((s) =>
+      s.id === selectedStrokeId
+        ? { ...s, bezierAnchors: anchors, points: sampled }
+        : s
+    );
+    recordHistory(updated);
+    setActiveTool('node');
+    setSelectedNodeIndex(0);
+  };
+
+  // Update selected Bézier node mode (corner / smooth / symmetric)
+  const handleChangeSelectedAnchorMode = (mode: BezierNodeMode) => {
+    if (!selectedStrokeId || selectedNodeIndex === null) return;
+    const target = strokes.find((s) => s.id === selectedStrokeId);
+    if (!target?.bezierAnchors) return;
+
+    const nextAnchors = setAnchorMode(
+      target.bezierAnchors,
+      selectedNodeIndex,
+      mode,
+      target.isClosed
+    );
+    const nextPoints = sampleBezierPath(nextAnchors, target.isClosed, 20);
+    const updated = strokes.map((s) =>
+      s.id === selectedStrokeId
+        ? { ...s, bezierAnchors: nextAnchors, points: nextPoints }
+        : s
+    );
+    recordHistory(updated);
+  };
+
+  // Clear handles on selected Bézier anchor (straight corner)
+  const handleFlattenSelectedAnchor = () => {
+    if (!selectedStrokeId || selectedNodeIndex === null) return;
+    const target = strokes.find((s) => s.id === selectedStrokeId);
+    if (!target?.bezierAnchors) return;
+
+    const nextAnchors = target.bezierAnchors.map((a, idx) =>
+      idx === selectedNodeIndex
+        ? { ...a, handleIn: null, handleOut: null, mode: 'corner' as BezierNodeMode }
+        : a
+    );
+    const nextPoints = sampleBezierPath(nextAnchors, target.isClosed, 20);
+    const updated = strokes.map((s) =>
+      s.id === selectedStrokeId
+        ? { ...s, bezierAnchors: nextAnchors, points: nextPoints }
+        : s
+    );
+    recordHistory(updated);
+  };
+
+  // Vector Transformation Operations
   const handleFlipHorizontal = () => {
     if (!selectedStrokeId) return;
     const updated = strokes.map((s) => {
       if (s.id === selectedStrokeId) {
-        return { ...s, points: flipPath(s.points, true, false) };
+        const bounds = getPathBounds(s.points);
+        const flippedPts = flipPath(s.points, true, false, bounds);
+        const flippedAnchors = s.bezierAnchors
+          ? transformBezierAnchors(s.bezierAnchors, ([x, y]) => [
+              bounds.maxX - (x - bounds.minX),
+              y,
+            ])
+          : undefined;
+        return { ...s, points: flippedPts, bezierAnchors: flippedAnchors };
       }
       return s;
     });
@@ -876,7 +1634,15 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
     if (!selectedStrokeId) return;
     const updated = strokes.map((s) => {
       if (s.id === selectedStrokeId) {
-        return { ...s, points: flipPath(s.points, false, true) };
+        const bounds = getPathBounds(s.points);
+        const flippedPts = flipPath(s.points, false, true, bounds);
+        const flippedAnchors = s.bezierAnchors
+          ? transformBezierAnchors(s.bezierAnchors, ([x, y]) => [
+              x,
+              bounds.maxY - (y - bounds.minY),
+            ])
+          : undefined;
+        return { ...s, points: flippedPts, bezierAnchors: flippedAnchors };
       }
       return s;
     });
@@ -887,7 +1653,17 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
     if (!selectedStrokeId) return;
     const updated = strokes.map((s) => {
       if (s.id === selectedStrokeId) {
-        return { ...s, points: rotatePath(s.points, 90) };
+        const bounds = getPathBounds(s.points);
+        const origin: Point2D = [bounds.centerX, bounds.centerY];
+        const angleRad = (90 * Math.PI) / 180;
+        const rotatedPts = rotatePath(s.points, 90, origin);
+        const rotatedAnchors = s.bezierAnchors
+          ? transformBezierAnchors(s.bezierAnchors, (p) => {
+              const r = rotatePoint(p, origin, angleRad);
+              return [Math.max(0, Math.min(100, r[0])), Math.max(0, Math.min(100, r[1]))];
+            })
+          : undefined;
+        return { ...s, points: rotatedPts, bezierAnchors: rotatedAnchors };
       }
       return s;
     });
@@ -898,7 +1674,17 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
     if (!selectedStrokeId) return;
     const updated = strokes.map((s) => {
       if (s.id === selectedStrokeId) {
-        return { ...s, points: centerPathInCanvas(s.points) };
+        const bounds = getPathBounds(s.points);
+        const dx = 50 - bounds.centerX;
+        const dy = 50 - bounds.centerY;
+        const centeredPts = centerPathInCanvas(s.points);
+        const centeredAnchors = s.bezierAnchors
+          ? transformBezierAnchors(s.bezierAnchors, ([x, y]) => [
+              Math.max(0, Math.min(100, x + dx)),
+              Math.max(0, Math.min(100, y + dy)),
+            ])
+          : undefined;
+        return { ...s, points: centeredPts, bezierAnchors: centeredAnchors };
       }
       return s;
     });
@@ -911,47 +1697,42 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
     if (!original) return;
     const newId = `stroke_${Date.now()}_dup`;
     const offsetPts = translatePath(original.points, 4, 4);
+    const offsetAnchors = original.bezierAnchors
+      ? transformBezierAnchors(original.bezierAnchors, ([x, y]) => [
+          Math.max(0, Math.min(100, x + 4)),
+          Math.max(0, Math.min(100, y + 4)),
+        ])
+      : undefined;
     const dup: StrokeItem = {
       ...original,
       id: newId,
       points: offsetPts,
+      bezierAnchors: offsetAnchors,
       isOuter: false,
     };
     recordHistory([...strokes, dup]);
     setSelectedStrokeId(newId);
   };
 
-  const handleDeleteSelectedStroke = () => {
-    if (!selectedStrokeId) return;
-    const updated = strokes.filter((s) => s.id !== selectedStrokeId);
-    recordHistory(reclassifyStrokes(updated));
-    setSelectedStrokeId(null);
-  };
-
-  const handleDeleteSelectedNode = () => {
-    if (!selectedStrokeId || selectedNodeIndex === null) return;
-    const active = strokes.find((s) => s.id === selectedStrokeId);
-    if (!active || active.points.length <= 2) return;
-
-    const nextPoints = active.points.filter((_, idx) => idx !== selectedNodeIndex);
-    const updated = strokes.map((s) => (s.id === selectedStrokeId ? { ...s, points: nextPoints } : s));
-    recordHistory(updated);
-    setSelectedNodeIndex(null);
-  };
-
-  // Node Smoothing / Conversion (Node Tool)
+  // Smooth Selected Stroke
   const handleSmoothSelectedStroke = () => {
     if (!selectedStrokeId) return;
     const updated = strokes.map((s) => {
       if (s.id === selectedStrokeId) {
-        return { ...s, points: catmullRomSpline(s.points, 3, s.isClosed) };
+        const smoothed = catmullRomSpline(s.points, 3, s.isClosed);
+        const anchors = polylineToBezierAnchors(smoothed, s.isClosed, 1.4);
+        return {
+          ...s,
+          points: sampleBezierPath(anchors, s.isClosed, 20),
+          bezierAnchors: anchors,
+        };
       }
       return s;
     });
     recordHistory(updated);
   };
 
-  // Offset Path (Outset / Inset - Illustrator Object > Path > Offset Path)
+  // Offset Path (Outset / Inset)
   const handleOffsetPath = (delta: number) => {
     if (!selectedStrokeId) return;
     const target = strokes.find((s) => s.id === selectedStrokeId);
@@ -972,10 +1753,13 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
   const handleExportSVG = () => {
     if (strokes.length === 0) return;
     const svgCode = exportPathsToSVG(strokes, modelName || 'cortador_vetorial');
-    downloadSVGFile(svgCode, `${modelName.replace(/\s+/g, '_').toLowerCase() || 'cortador'}.svg`);
+    downloadSVGFile(
+      svgCode,
+      `${modelName.replace(/\s+/g, '_').toLowerCase() || 'cortador'}.svg`
+    );
   };
 
-  // SVG Import from string / file
+  // SVG Import
   const handleImportSVGCode = (svgCode: string) => {
     try {
       const parsedPaths = parseSvgStringToPaths(svgCode);
@@ -984,12 +1768,17 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
         return;
       }
 
-      const importedStrokes: StrokeItem[] = parsedPaths.map((pts, idx) => ({
-        id: `svg_path_${Date.now()}_${idx}`,
-        points: pts,
-        isClosed: distance(pts[0], pts[pts.length - 1]) <= 2,
-        isOuter: idx === 0,
-      }));
+      const importedStrokes: StrokeItem[] = parsedPaths.map((pts, idx) => {
+        const closed = distance(pts[0], pts[pts.length - 1]) <= 2;
+        const anchors = polylineToBezierAnchors(pts, closed, 1.2);
+        return {
+          id: `svg_path_${Date.now()}_${idx}`,
+          points: pts,
+          bezierAnchors: anchors.length >= 2 ? anchors : undefined,
+          isClosed: closed,
+          isOuter: idx === 0,
+        };
+      });
 
       recordHistory(reclassifyStrokes([...strokes, ...importedStrokes]));
       setSvgModalOpen(false);
@@ -1032,7 +1821,12 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
         img.onerror = rej;
       });
 
-      const { outerPerimeter, innerDetails } = await traceImageToLineart(img, threshold, invert, 0.55);
+      const { outerPerimeter, innerDetails } = await traceImageToLineart(
+        img,
+        threshold,
+        invert,
+        0.55
+      );
 
       const customModel: ModelLineart = {
         id: `custom_upload_${Date.now()}`,
@@ -1058,7 +1852,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
   const handleProcessDrawnLines = () => {
     if (strokes.length === 0) return;
 
-    let outerStroke = strokes.find((s) => s.isOuter) || strokes[0];
+    const outerStroke = strokes.find((s) => s.isOuter) || strokes[0];
     let outerPerimeter = outerStroke.points;
     if (!outerStroke.isClosed && outerPerimeter.length >= 3) {
       outerPerimeter = closeLoop(outerPerimeter);
@@ -1073,7 +1867,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
       name: modelName || 'Meu Cortador Vetorial',
       category: 'frames',
       categoryLabel: 'Desenho Próprio',
-      description: 'Cortador e carimbo gerados no estúdio vetorial profissional.',
+      description: 'Cortador e carimbo gerados com curvas Bézier e grade magnética.',
       iconName: 'PenTool',
       outerPerimeter,
       innerDetails,
@@ -1087,6 +1881,10 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
 
   const activeStroke = strokes.find((s) => s.id === selectedStrokeId);
   const outerStroke = strokes.find((s) => s.isOuter);
+  const selectedAnchor =
+    activeStroke?.bezierAnchors && selectedNodeIndex !== null
+      ? activeStroke.bezierAnchors[selectedNodeIndex]
+      : null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-2 lg:p-5 bg-black/85 backdrop-blur-md animate-in fade-in duration-200">
@@ -1099,13 +1897,13 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
             </div>
             <div>
               <h2 className="text-sm sm:text-base font-bold text-slate-100 flex items-center gap-2">
-                <span>Estúdio Vetorial (Estilo Illustrator & Inkscape)</span>
+                <span>Estúdio Vetorial (Curvas Bézier & Grade Magnética)</span>
                 <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 uppercase">
-                  Nós & Curvas
+                  Illustrator / Inkscape
                 </span>
               </h2>
               <p className="text-[11px] text-slate-400">
-                Edição direta de nós e curvas, transformações geométricas, deslocamento de contorno (offset) e importação/exportação SVG.
+                Desenhe com Caneta Bézier (alças tangentes), edite nós e curvas, alinhe com Grade Magnética ou vetorize imagens.
               </p>
             </div>
           </div>
@@ -1127,8 +1925,8 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                 : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
             }`}
           >
-            <Pen className="w-4 h-4" />
-            <span>Editor Vetorial & Desenho</span>
+            <Spline className="w-4 h-4" />
+            <span>Editor Vetorial, Bézier & Grade Magnética</span>
           </button>
           <button
             onClick={() => setTab('upload')}
@@ -1189,7 +1987,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                 onClick={handleExportSVG}
                 disabled={strokes.length === 0}
                 className="flex items-center gap-1.5 px-3 py-1 text-xs bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-amber-400 rounded-lg border border-slate-700 transition-colors cursor-pointer"
-                title="Baixar arquivo .SVG compatível com Illustrator e Inkscape"
+                title="Baixar arquivo .SVG com curvas Bézier reais compatível com Illustrator e Inkscape"
               >
                 <DownloadIcon className="w-3.5 h-3.5" />
                 <span>Exportar SVG</span>
@@ -1204,7 +2002,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                 {/* Illustrator/Inkscape Main Toolbar */}
                 <div className="flex flex-wrap items-center justify-between gap-2 p-2 bg-slate-950/80 rounded-xl border border-slate-800 text-xs">
                   {/* Vector Tools Group */}
-                  <div className="flex items-center gap-1 bg-slate-900 p-1 rounded-lg border border-slate-800">
+                  <div className="flex flex-wrap items-center gap-1 bg-slate-900 p-1 rounded-lg border border-slate-800">
                     {/* Selection Tool (V) */}
                     <button
                       onClick={() => setActiveTool('select')}
@@ -1219,7 +2017,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                       <span className="text-[11px]">Seleção (V)</span>
                     </button>
 
-                    {/* Direct Selection / Node Tool (A / N) */}
+                    {/* Direct Selection / Node & Handle Tool (A) */}
                     <button
                       onClick={() => setActiveTool('node')}
                       className={`p-1.5 px-2.5 rounded flex items-center gap-1.5 transition-colors cursor-pointer ${
@@ -1227,15 +2025,29 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                           ? 'bg-cyan-600 text-white font-bold shadow'
                           : 'text-slate-400 hover:text-slate-200'
                       }`}
-                      title="Editar Nós / Vértices (A / N) - Ajuste pontos individuais com precisão"
+                      title="Editar Nós & Alças Bézier (A) - Ajuste âncoras e tangentes"
                     >
                       <Waypoints className="w-3.5 h-3.5" />
-                      <span className="text-[11px]">Nós (A)</span>
+                      <span className="text-[11px]">Nós Bézier (A)</span>
                     </button>
 
-                    <div className="w-[1px] h-5 bg-slate-800 mx-1" />
+                    <div className="w-[1px] h-5 bg-slate-800 mx-0.5" />
 
-                    {/* Pen Tool (P) */}
+                    {/* Cubic Bézier Pen Tool (B) */}
+                    <button
+                      onClick={() => setActiveTool('bezier')}
+                      className={`p-1.5 px-2.5 rounded flex items-center gap-1.5 transition-colors cursor-pointer ${
+                        activeTool === 'bezier'
+                          ? 'bg-emerald-500 text-slate-950 font-bold shadow'
+                          : 'text-slate-400 hover:text-emerald-300'
+                      }`}
+                      title="Caneta Bézier (B) - Clique para âncora reta, clique e arraste para curvar alças"
+                    >
+                      <PenTool className="w-3.5 h-3.5" />
+                      <span className="text-[11px]">Bézier (B)</span>
+                    </button>
+
+                    {/* Freehand Pen Tool (P) */}
                     <button
                       onClick={() => setActiveTool('pen')}
                       className={`p-1.5 px-2 rounded flex items-center gap-1.5 transition-colors cursor-pointer ${
@@ -1243,10 +2055,10 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                           ? 'bg-amber-500 text-slate-950 font-bold'
                           : 'text-slate-400 hover:text-slate-200'
                       }`}
-                      title="Caneta Bézier / Traçado Livre (P)"
+                      title="Mão Livre com Estabilizador & Auto-Bézier (P)"
                     >
                       <Pen className="w-3.5 h-3.5" />
-                      <span className="hidden sm:inline text-[11px]">Caneta</span>
+                      <span className="hidden sm:inline text-[11px]">Livre (P)</span>
                     </button>
 
                     {/* Line / Polyline */}
@@ -1257,7 +2069,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                           ? 'bg-amber-500 text-slate-950 font-bold'
                           : 'text-slate-400 hover:text-slate-200'
                       }`}
-                      title="Linha Reta / Segmentos"
+                      title="Linha Reta com Snap na Grade"
                     >
                       <Minus className="w-3.5 h-3.5" />
                     </button>
@@ -1283,7 +2095,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                           ? 'bg-amber-500 text-slate-950 font-bold'
                           : 'text-slate-400 hover:text-slate-200'
                       }`}
-                      title="Retângulo / Moldura"
+                      title="Retângulo / Moldura Geométrica"
                     >
                       <Square className="w-3.5 h-3.5" />
                     </button>
@@ -1332,8 +2144,8 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                   <div className="flex items-center gap-1">
                     <button
                       onClick={handleUndo}
-                      disabled={undoStack.length === 0}
-                      className="p-1.5 px-2 rounded text-slate-400 hover:text-slate-200 hover:bg-slate-800 disabled:opacity-30 transition-colors"
+                      disabled={undoStack.length === 0 && bezierDraft.length === 0}
+                      className="p-1.5 px-2 rounded text-slate-400 hover:text-slate-200 hover:bg-slate-800 disabled:opacity-30 transition-colors cursor-pointer"
                       title="Desfazer (Ctrl+Z)"
                     >
                       <Undo2 className="w-3.5 h-3.5" />
@@ -1341,7 +2153,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                     <button
                       onClick={handleRedo}
                       disabled={redoStack.length === 0}
-                      className="p-1.5 px-2 rounded text-slate-400 hover:text-slate-200 hover:bg-slate-800 disabled:opacity-30 transition-colors"
+                      className="p-1.5 px-2 rounded text-slate-400 hover:text-slate-200 hover:bg-slate-800 disabled:opacity-30 transition-colors cursor-pointer"
                       title="Refazer (Ctrl+Y)"
                     >
                       <Redo2 className="w-3.5 h-3.5" />
@@ -1349,10 +2161,11 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                     <button
                       onClick={() => {
                         recordHistory([]);
+                        setBezierDraft([]);
                         setSelectedStrokeId(null);
                         setSelectedNodeIndex(null);
                       }}
-                      className="p-1.5 px-2 rounded text-slate-400 hover:text-rose-400 hover:bg-rose-950/40 transition-colors"
+                      className="p-1.5 px-2 rounded text-slate-400 hover:text-rose-400 hover:bg-rose-950/40 transition-colors cursor-pointer"
                       title="Limpar tudo"
                     >
                       <RotateCcw className="w-3.5 h-3.5" />
@@ -1370,116 +2183,314 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                     onPointerMove={handlePointerMove}
                     onPointerUp={handlePointerUp}
                     onPointerCancel={handlePointerUp}
+                    onDoubleClick={handleDoubleClick}
+                    onPointerLeave={() => {
+                      setCursorPos(null);
+                      setRawCursorPos(null);
+                    }}
                     className="cursor-crosshair w-full h-full block touch-none"
                     style={{ touchAction: 'none' }}
                   />
 
                   {/* HUD Info Tag */}
-                  <div className="absolute top-3 left-3 bg-slate-900/90 backdrop-blur-md px-3 py-1.5 rounded-lg border border-slate-700/80 text-[11px] font-mono text-slate-300 flex items-center gap-3 pointer-events-none">
+                  <div className="absolute top-3 left-3 bg-slate-900/90 backdrop-blur-md px-3 py-1.5 rounded-lg border border-slate-700/80 text-[11px] font-mono text-slate-300 flex flex-wrap items-center gap-2.5 pointer-events-none">
                     <span className="flex items-center gap-1 text-amber-400">
                       <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
-                      {cursorPos ? `X: ${cursorPos[0].toFixed(1)}% | Y: ${cursorPos[1].toFixed(1)}%` : '0, 0'}
+                      {cursorPos
+                        ? `X: ${cursorPos[0].toFixed(1)}% Y: ${cursorPos[1].toFixed(1)}%`
+                        : '0.0, 0.0'}
                     </span>
-                    <span className="text-slate-500">|</span>
+                    <span className="text-slate-600">|</span>
+                    {enableSnapGrid && (
+                      <>
+                        <span className="text-emerald-400 flex items-center gap-1 font-semibold">
+                          <Magnet className="w-3 h-3" />
+                          SNAP {gridSpacing}%
+                        </span>
+                        <span className="text-slate-600">|</span>
+                      </>
+                    )}
                     <span className="text-cyan-400">
-                      Modo: {activeTool === 'select' ? 'Seleção (V)' : activeTool === 'node' ? 'Nós (A)' : 'Traçado'}
+                      {activeTool === 'select'
+                        ? 'Seleção (V)'
+                        : activeTool === 'node'
+                        ? 'Nós & Alças (A)'
+                        : activeTool === 'bezier'
+                        ? 'Caneta Bézier (B)'
+                        : activeTool === 'pen'
+                        ? 'Mão Livre (P)'
+                        : 'Forma'}
                     </span>
                     {activeStroke && (
                       <>
-                        <span className="text-slate-500">|</span>
-                        <span className="text-slate-300">{activeStroke.points.length} nós</span>
+                        <span className="text-slate-600">|</span>
+                        <span className="text-slate-300">
+                          {activeStroke.bezierAnchors
+                            ? `${activeStroke.bezierAnchors.length} âncoras Bézier`
+                            : `${activeStroke.points.length} nós`}
+                        </span>
                       </>
                     )}
                   </div>
 
-                  {/* Magnetic snap helper */}
+                  {/* Active Bézier Draft Floating Controls */}
+                  {bezierDraft.length > 0 && (
+                    <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-slate-900/95 backdrop-blur-md px-3 py-2 rounded-xl border border-emerald-500/40 shadow-2xl flex flex-wrap items-center justify-center gap-2 text-xs z-10">
+                      <span className="text-[11px] text-emerald-300 font-medium px-1">
+                        {bezierDraft.length} {bezierDraft.length === 1 ? 'âncora' : 'âncoras'} · Arraste para curvar alças
+                      </span>
+                      {bezierDraft.length >= 3 && (
+                        <button
+                          onClick={() => commitBezierDraft(true)}
+                          className="px-2.5 py-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded-lg text-[11px] cursor-pointer"
+                        >
+                          Fechar Contorno
+                        </button>
+                      )}
+                      {bezierDraft.length >= 2 && (
+                        <button
+                          onClick={() => commitBezierDraft(false)}
+                          className="px-2.5 py-1 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold rounded-lg text-[11px] cursor-pointer"
+                        >
+                          Finalizar Aberto (Enter)
+                        </button>
+                      )}
+                      <button
+                        onClick={() => setBezierDraft([])}
+                        className="px-2 py-1 bg-slate-800 hover:bg-rose-900/60 text-slate-300 hover:text-rose-200 rounded-lg text-[11px] cursor-pointer"
+                      >
+                        Cancelar
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Magnetic snap loop close helper */}
                   {isNearStart && (
-                    <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-emerald-500 text-slate-950 font-bold text-xs px-3 py-1.5 rounded-full shadow-lg flex items-center gap-1.5 animate-bounce pointer-events-none">
-                      <Magnet className="w-4 h-4" />
-                      <span>Solte para Fechar o Contorno!</span>
+                    <div className="absolute top-14 left-1/2 -translate-x-1/2 bg-emerald-500 text-slate-950 font-bold text-xs px-3 py-1 rounded-full shadow-lg flex items-center gap-1.5 animate-bounce pointer-events-none">
+                      <Magnet className="w-3.5 h-3.5" />
+                      <span>
+                        {activeTool === 'bezier'
+                          ? 'Clique para Fechar Curva Bézier!'
+                          : 'Solte para Fechar o Contorno!'}
+                      </span>
                     </div>
                   )}
 
                   {/* Instructions on empty */}
-                  {strokes.length === 0 && !isPointerDownRef.current && (
+                  {strokes.length === 0 && bezierDraft.length === 0 && !isPointerDownRef.current && (
                     <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none p-6 text-center">
                       <div className="w-12 h-12 rounded-full bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400 mb-3">
-                        <Waypoints className="w-6 h-6" />
+                        <Spline className="w-6 h-6" />
                       </div>
                       <p className="text-sm font-semibold text-slate-200">
-                        Prancheta Vetorial Estilo Illustrator / Inkscape
+                        Prancheta Vetorial com Bézier & Grade Magnética
                       </p>
-                      <p className="text-xs text-slate-400 max-w-sm mt-1">
-                        Use a Caneta para desenhar formas ou importar SVGs. Alterne para a ferramenta de <strong>Nós (A)</strong> para editar pontos ou <strong>Seleção (V)</strong> para transformar objetos.
+                      <p className="text-xs text-slate-400 max-w-md mt-1">
+                        Use a <strong>Caneta Bézier (B)</strong> para clicar e arrastar alças de curva, ou desenhe à <strong>Mão Livre (P)</strong> com conversão automática para curvas editáveis. A <strong>Grade Magnética</strong> alinha formas geométricas com precisão.
                       </p>
                     </div>
                   )}
                 </div>
 
-                {/* Sub-toolbar: Grid, Snap, Guides, Mirror */}
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
-                  <button
-                    onClick={() => setShowGrid(!showGrid)}
-                    className={`p-2 rounded-xl border flex items-center justify-center gap-2 transition-colors cursor-pointer ${
-                      showGrid ? 'bg-slate-800 text-amber-400 border-amber-500/40' : 'bg-slate-950/60 text-slate-400 border-slate-800'
-                    }`}
-                  >
-                    <Grid className="w-3.5 h-3.5" />
-                    <span>Grade Milimétrica</span>
-                  </button>
+                {/* Sub-toolbar: Magnetic Grid Mode & Guides */}
+                <div className="p-2.5 bg-slate-950/70 rounded-xl border border-slate-800 flex flex-col gap-2">
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+                    <button
+                      onClick={() => setEnableSnapGrid(!enableSnapGrid)}
+                      className={`p-2 rounded-xl border flex items-center justify-center gap-2 transition-colors cursor-pointer ${
+                        enableSnapGrid
+                          ? 'bg-emerald-950/60 text-emerald-300 border-emerald-500/60 font-semibold shadow-sm'
+                          : 'bg-slate-900/60 text-slate-400 border-slate-800 hover:text-slate-200'
+                      }`}
+                      title="Ativar/Desativar Grade Magnética (Atalho: G · Segure Alt para ignorar temporariamente)"
+                    >
+                      <Magnet className="w-3.5 h-3.5" />
+                      <span>Grade Magnética (G)</span>
+                    </button>
 
-                  <button
-                    onClick={() => setEnableSnapGrid(!enableSnapGrid)}
-                    className={`p-2 rounded-xl border flex items-center justify-center gap-2 transition-colors cursor-pointer ${
-                      enableSnapGrid ? 'bg-slate-800 text-amber-400 border-amber-500/40' : 'bg-slate-950/60 text-slate-400 border-slate-800'
-                    }`}
-                  >
-                    <Magnet className="w-3.5 h-3.5" />
-                    <span>Atrair à Grade</span>
-                  </button>
+                    <button
+                      onClick={() => setShowGrid(!showGrid)}
+                      className={`p-2 rounded-xl border flex items-center justify-center gap-2 transition-colors cursor-pointer ${
+                        showGrid
+                          ? 'bg-slate-800 text-amber-400 border-amber-500/40'
+                          : 'bg-slate-900/60 text-slate-400 border-slate-800'
+                      }`}
+                    >
+                      <Grid className="w-3.5 h-3.5" />
+                      <span>Exibir Grade</span>
+                    </button>
 
-                  <button
-                    onClick={() => setShowCenterGuides(!showCenterGuides)}
-                    className={`p-2 rounded-xl border flex items-center justify-center gap-2 transition-colors cursor-pointer ${
-                      showCenterGuides ? 'bg-slate-800 text-amber-400 border-amber-500/40' : 'bg-slate-950/60 text-slate-400 border-slate-800'
-                    }`}
-                  >
-                    <Crosshair className="w-3.5 h-3.5" />
-                    <span>Eixos Centrais</span>
-                  </button>
+                    <button
+                      onClick={() => setShowCenterGuides(!showCenterGuides)}
+                      className={`p-2 rounded-xl border flex items-center justify-center gap-2 transition-colors cursor-pointer ${
+                        showCenterGuides
+                          ? 'bg-slate-800 text-amber-400 border-amber-500/40'
+                          : 'bg-slate-900/60 text-slate-400 border-slate-800'
+                      }`}
+                    >
+                      <Crosshair className="w-3.5 h-3.5" />
+                      <span>Eixos Centrais</span>
+                    </button>
 
-                  <button
-                    onClick={() => setMirrorMode(!mirrorMode)}
-                    className={`p-2 rounded-xl border flex items-center justify-center gap-2 transition-colors cursor-pointer ${
-                      mirrorMode ? 'bg-cyan-950/60 text-cyan-400 border-cyan-500/60' : 'bg-slate-950/60 text-slate-400 border-slate-800'
-                    }`}
-                  >
-                    <SplitSquareVertical className="w-3.5 h-3.5" />
-                    <span>Modo Espelho</span>
-                  </button>
+                    <button
+                      onClick={() => setMirrorMode(!mirrorMode)}
+                      className={`p-2 rounded-xl border flex items-center justify-center gap-2 transition-colors cursor-pointer ${
+                        mirrorMode
+                          ? 'bg-cyan-950/60 text-cyan-400 border-cyan-500/60'
+                          : 'bg-slate-900/60 text-slate-400 border-slate-800'
+                      }`}
+                    >
+                      <SplitSquareVertical className="w-3.5 h-3.5" />
+                      <span>Modo Espelho</span>
+                    </button>
+                  </div>
+
+                  {/* Magnetic Grid Spacing Density Selector */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-slate-800/80 text-[11px]">
+                    <span className="text-slate-400 flex items-center gap-1.5">
+                      <Magnet className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Passo da Grade Magnética:</span>
+                    </span>
+                    <div className="flex items-center gap-1 bg-slate-900 p-0.5 rounded-lg border border-slate-800">
+                      {(
+                        [
+                          { value: 2, label: 'Fina (2%)' },
+                          { value: 5, label: 'Padrão (5%)' },
+                          { value: 10, label: 'Média (10%)' },
+                          { value: 12.5, label: 'Oitavos (12.5%)' },
+                        ] as { value: GridSpacing; label: string }[]
+                      ).map((opt) => (
+                        <button
+                          key={opt.value}
+                          onClick={() => {
+                            setGridSpacing(opt.value);
+                            if (!showGrid) setShowGrid(true);
+                          }}
+                          className={`px-2 py-1 rounded-md text-[10px] font-medium transition-colors cursor-pointer ${
+                            gridSpacing === opt.value
+                              ? 'bg-emerald-500 text-slate-950 font-bold'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                    <span className="text-[10px] text-slate-500 hidden sm:inline">
+                      Segure <kbd className="px-1 py-0.5 bg-slate-800 rounded text-slate-300">Alt</kbd> para ajuste livre
+                    </span>
+                  </div>
                 </div>
               </div>
 
-              {/* Right Column: Illustrator Inspector / Node Tools / Layers (4 cols) */}
+              {/* Right Column: Inspector, Bézier Node Controls & Layers (4 cols) */}
               <div className="lg:col-span-4 flex flex-col gap-3">
+                {/* Selected Bézier Anchor Controls */}
+                {activeTool === 'node' && activeStroke && selectedAnchor && (
+                  <div className="p-3.5 bg-slate-950/90 rounded-2xl border border-cyan-500/50 shadow-lg flex flex-col gap-2.5 animate-in fade-in">
+                    <div className="flex items-center justify-between text-xs font-semibold text-cyan-300">
+                      <span className="flex items-center gap-1.5">
+                        <Spline className="w-4 h-4" />
+                        <span>Âncora Bézier #{(selectedNodeIndex ?? 0) + 1}</span>
+                      </span>
+                      <span className="text-[10px] font-mono uppercase bg-cyan-500/15 px-2 py-0.5 rounded text-cyan-300">
+                        {selectedAnchor.mode === 'corner'
+                          ? 'Canto'
+                          : selectedAnchor.mode === 'smooth'
+                          ? 'Suave'
+                          : 'Simétrico'}
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-1.5 text-[10px]">
+                      <button
+                        onClick={() => handleChangeSelectedAnchorMode('corner')}
+                        className={`py-1.5 px-2 rounded-lg border font-medium transition-colors cursor-pointer ${
+                          selectedAnchor.mode === 'corner'
+                            ? 'bg-cyan-500 text-slate-950 border-cyan-400 font-bold'
+                            : 'bg-slate-900 text-slate-300 border-slate-700 hover:bg-slate-800'
+                        }`}
+                        title="Canto / Cúspide: Alças independentes para ângulos agudos"
+                      >
+                        Canto
+                      </button>
+                      <button
+                        onClick={() => handleChangeSelectedAnchorMode('smooth')}
+                        className={`py-1.5 px-2 rounded-lg border font-medium transition-colors cursor-pointer ${
+                          selectedAnchor.mode === 'smooth'
+                            ? 'bg-cyan-500 text-slate-950 border-cyan-400 font-bold'
+                            : 'bg-slate-900 text-slate-300 border-slate-700 hover:bg-slate-800'
+                        }`}
+                        title="Suave: Alças alinhadas com comprimentos independentes"
+                      >
+                        Suave
+                      </button>
+                      <button
+                        onClick={() => handleChangeSelectedAnchorMode('symmetric')}
+                        className={`py-1.5 px-2 rounded-lg border font-medium transition-colors cursor-pointer ${
+                          selectedAnchor.mode === 'symmetric'
+                            ? 'bg-cyan-500 text-slate-950 border-cyan-400 font-bold'
+                            : 'bg-slate-900 text-slate-300 border-slate-700 hover:bg-slate-800'
+                        }`}
+                        title="Simétrico: Alças alinhadas e espelhadas com mesmo comprimento"
+                      >
+                        Simétrico
+                      </button>
+                    </div>
+
+                    <div className="flex items-center gap-1.5 pt-1">
+                      <button
+                        onClick={handleFlattenSelectedAnchor}
+                        className="flex-1 py-1.5 px-2 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded-lg text-[10px] text-slate-300 flex items-center justify-center gap-1 cursor-pointer"
+                        title="Remover alças de curva deste nó (tornar vértice reto)"
+                      >
+                        <CornerDownRight className="w-3 h-3 text-amber-400" />
+                        <span>Zerar Alças</span>
+                      </button>
+                      <button
+                        onClick={handleDeleteSelectedNode}
+                        className="py-1.5 px-2.5 bg-rose-950/40 hover:bg-rose-900/60 border border-rose-500/40 rounded-lg text-[10px] text-rose-300 flex items-center gap-1 cursor-pointer"
+                        title="Excluir este nó (Delete)"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                        <span>Excluir Nó</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 {/* Contextual Transform Box (When Shape is Selected) */}
                 {activeStroke ? (
                   <div className="p-3.5 bg-slate-950/80 rounded-2xl border border-blue-500/40 shadow-lg flex flex-col gap-2.5 animate-in fade-in">
                     <div className="flex items-center justify-between text-xs font-semibold text-blue-400">
                       <span className="flex items-center gap-1.5">
                         <MousePointer className="w-4 h-4" />
-                        <span>Transformar Objeto Selecionado</span>
+                        <span>Objeto Selecionado</span>
                       </span>
                       <span className="text-[10px] text-slate-400 font-mono">
-                        {activeStroke.points.length} nós
+                        {activeStroke.bezierAnchors
+                          ? `${activeStroke.bezierAnchors.length} âncoras Bézier`
+                          : `${activeStroke.points.length} pontos`}
                       </span>
                     </div>
+
+                    {/* Convert to Bézier button if stroke doesn't have Bézier anchors yet */}
+                    {!activeStroke.bezierAnchors && (
+                      <button
+                        onClick={handleConvertSelectedToBezier}
+                        className="w-full py-1.5 px-3 bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 rounded-xl text-xs font-semibold text-emerald-300 flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                        title="Converter contorno em âncoras e alças Bézier editáveis"
+                      >
+                        <Spline className="w-3.5 h-3.5" />
+                        <span>Converter em Curvas Bézier Editáveis</span>
+                      </button>
+                    )}
 
                     {/* Transform Buttons Grid */}
                     <div className="grid grid-cols-4 gap-1.5">
                       <button
                         onClick={handleFlipHorizontal}
-                        className="p-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 rounded-lg flex flex-col items-center justify-center gap-1 text-[10px] text-slate-300 transition-colors"
+                        className="p-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 rounded-lg flex flex-col items-center justify-center gap-1 text-[10px] text-slate-300 transition-colors cursor-pointer"
                         title="Inverter Horizontalmente"
                       >
                         <FlipHorizontal className="w-3.5 h-3.5 text-blue-400" />
@@ -1488,7 +2499,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
 
                       <button
                         onClick={handleFlipVertical}
-                        className="p-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 rounded-lg flex flex-col items-center justify-center gap-1 text-[10px] text-slate-300 transition-colors"
+                        className="p-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 rounded-lg flex flex-col items-center justify-center gap-1 text-[10px] text-slate-300 transition-colors cursor-pointer"
                         title="Inverter Verticalmente"
                       >
                         <FlipVertical className="w-3.5 h-3.5 text-blue-400" />
@@ -1497,7 +2508,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
 
                       <button
                         onClick={handleRotate90}
-                        className="p-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 rounded-lg flex flex-col items-center justify-center gap-1 text-[10px] text-slate-300 transition-colors"
+                        className="p-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 rounded-lg flex flex-col items-center justify-center gap-1 text-[10px] text-slate-300 transition-colors cursor-pointer"
                         title="Girar 90 graus"
                       >
                         <RotateCw className="w-3.5 h-3.5 text-blue-400" />
@@ -1506,7 +2517,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
 
                       <button
                         onClick={handleCenterInCanvas}
-                        className="p-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 rounded-lg flex flex-col items-center justify-center gap-1 text-[10px] text-slate-300 transition-colors"
+                        className="p-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-700/80 rounded-lg flex flex-col items-center justify-center gap-1 text-[10px] text-slate-300 transition-colors cursor-pointer"
                         title="Centralizar no centro do quadro"
                       >
                         <Maximize2 className="w-3.5 h-3.5 text-blue-400" />
@@ -1514,7 +2525,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                       </button>
                     </div>
 
-                    {/* Offset Path (Inkscape / Illustrator Inset/Outset) */}
+                    {/* Offset Path */}
                     <div className="pt-2 border-t border-slate-800">
                       <span className="text-[11px] text-slate-400 block mb-1">
                         Deslocamento de Contorno (Offset Path):
@@ -1522,31 +2533,27 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                       <div className="grid grid-cols-4 gap-1.5">
                         <button
                           onClick={() => handleOffsetPath(2)}
-                          className="px-2 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded text-[10px] text-amber-300 transition-colors"
-                          title="Expandir contorno para fora (+2%)"
+                          className="px-2 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded text-[10px] text-amber-300 transition-colors cursor-pointer"
                         >
-                          +2% Outset
+                          +2% Out
                         </button>
                         <button
                           onClick={() => handleOffsetPath(4)}
-                          className="px-2 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded text-[10px] text-amber-300 transition-colors"
-                          title="Expandir contorno para fora (+4%)"
+                          className="px-2 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded text-[10px] text-amber-300 transition-colors cursor-pointer"
                         >
-                          +4% Outset
+                          +4% Out
                         </button>
                         <button
                           onClick={() => handleOffsetPath(-2)}
-                          className="px-2 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded text-[10px] text-cyan-300 transition-colors"
-                          title="Contrair contorno para dentro (-2%)"
+                          className="px-2 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded text-[10px] text-cyan-300 transition-colors cursor-pointer"
                         >
-                          -2% Inset
+                          -2% In
                         </button>
                         <button
                           onClick={() => handleOffsetPath(-4)}
-                          className="px-2 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded text-[10px] text-cyan-300 transition-colors"
-                          title="Contrair contorno para dentro (-4%)"
+                          className="px-2 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded text-[10px] text-cyan-300 transition-colors cursor-pointer"
                         >
-                          -4% Inset
+                          -4% In
                         </button>
                       </div>
                     </div>
@@ -1555,16 +2562,16 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                     <div className="flex items-center gap-2 pt-1">
                       <button
                         onClick={handleSmoothSelectedStroke}
-                        className="flex-1 py-1 px-2 bg-slate-900 hover:bg-cyan-950/60 border border-cyan-500/40 rounded text-[10px] text-cyan-300 transition-colors flex items-center justify-center gap-1"
-                        title="Suavizar curvas com curvas spline Bézier"
+                        className="flex-1 py-1 px-2 bg-slate-900 hover:bg-cyan-950/60 border border-cyan-500/40 rounded text-[10px] text-cyan-300 transition-colors flex items-center justify-center gap-1 cursor-pointer"
+                        title="Suavizar curvas e gerar âncoras Bézier suaves"
                       >
                         <Sparkles className="w-3 h-3" />
-                        <span>Suavizar Curvas</span>
+                        <span>Suavizar Bézier</span>
                       </button>
 
                       <button
                         onClick={handleDuplicateSelected}
-                        className="py-1 px-2.5 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded text-[10px] text-slate-300 transition-colors flex items-center gap-1"
+                        className="py-1 px-2.5 bg-slate-900 hover:bg-slate-800 border border-slate-700 rounded text-[10px] text-slate-300 transition-colors flex items-center gap-1 cursor-pointer"
                         title="Duplicar Objeto"
                       >
                         <Copy className="w-3 h-3" />
@@ -1573,7 +2580,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
 
                       <button
                         onClick={handleDeleteSelectedStroke}
-                        className="p-1 px-2 bg-rose-950/40 hover:bg-rose-900/60 border border-rose-500/40 rounded text-rose-300 transition-colors"
+                        className="p-1 px-2 bg-rose-950/40 hover:bg-rose-900/60 border border-rose-500/40 rounded text-rose-300 transition-colors cursor-pointer"
                         title="Excluir este objeto"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
@@ -1581,11 +2588,10 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                     </div>
                   </div>
                 ) : (
-                  /* Node editing guidance */
                   <div className="p-3 bg-slate-950/70 rounded-2xl border border-slate-800 text-xs text-slate-400 flex items-start gap-2.5">
-                    <Waypoints className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5" />
+                    <PenTool className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
                     <span>
-                      Clique em qualquer objeto com a <strong>Ferramenta Seleção (V)</strong> para mover, girar e redimensionar, ou com a <strong>Ferramenta Nós (A)</strong> para manipular vértices individuais.
+                      Dica: Use <strong>Bézier (B)</strong> para curvas perfeitas com alças, <strong>Livre (P)</strong> para esboços suaves e <strong>Nós Bézier (A)</strong> para esculpir qualquer ponto ou alça tangente.
                     </span>
                   </div>
                 )}
@@ -1594,42 +2600,74 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                 <div className="p-3.5 bg-slate-950/70 rounded-2xl border border-slate-800 flex flex-col gap-2.5">
                   <div className="flex items-center gap-2 text-xs font-semibold text-slate-200">
                     <Sliders className="w-4 h-4 text-amber-400" />
-                    <span>Precisão & Suavizador de Caneta</span>
+                    <span>Motor de Traço & Auto-Bézier</span>
                   </div>
 
                   <div>
                     <label className="text-[11px] text-slate-400 flex items-center justify-between mb-1">
-                      <span>Suavizador Anti-Trepidação:</span>
+                      <span>Estabilizador Mão Livre:</span>
                       <span className="font-mono text-amber-400 uppercase text-[10px]">
-                        {smoothingLevel === 'none' ? 'Bruto' : smoothingLevel === 'medium' ? 'Equilibrado' : 'Ultra'}
+                        {smoothingLevel === 'none'
+                          ? 'Bruto'
+                          : smoothingLevel === 'medium'
+                          ? 'Equilibrado'
+                          : 'Ultra'}
                       </span>
                     </label>
                     <div className="grid grid-cols-3 gap-1 bg-slate-900 p-1 rounded-xl border border-slate-800 text-[11px]">
                       <button
                         onClick={() => setSmoothingLevel('none')}
-                        className={`py-1 rounded-lg font-medium transition-colors ${
-                          smoothingLevel === 'none' ? 'bg-amber-500 text-slate-950 font-bold' : 'text-slate-400 hover:text-slate-200'
+                        className={`py-1 rounded-lg font-medium transition-colors cursor-pointer ${
+                          smoothingLevel === 'none'
+                            ? 'bg-amber-500 text-slate-950 font-bold'
+                            : 'text-slate-400 hover:text-slate-200'
                         }`}
                       >
                         Bruto
                       </button>
                       <button
                         onClick={() => setSmoothingLevel('medium')}
-                        className={`py-1 rounded-lg font-medium transition-colors ${
-                          smoothingLevel === 'medium' ? 'bg-amber-500 text-slate-950 font-bold' : 'text-slate-400 hover:text-slate-200'
+                        className={`py-1 rounded-lg font-medium transition-colors cursor-pointer ${
+                          smoothingLevel === 'medium'
+                            ? 'bg-amber-500 text-slate-950 font-bold'
+                            : 'text-slate-400 hover:text-slate-200'
                         }`}
                       >
                         Suave
                       </button>
                       <button
                         onClick={() => setSmoothingLevel('high')}
-                        className={`py-1 rounded-lg font-medium transition-colors ${
-                          smoothingLevel === 'high' ? 'bg-amber-500 text-slate-950 font-bold' : 'text-slate-400 hover:text-slate-200'
+                        className={`py-1 rounded-lg font-medium transition-colors cursor-pointer ${
+                          smoothingLevel === 'high'
+                            ? 'bg-amber-500 text-slate-950 font-bold'
+                            : 'text-slate-400 hover:text-slate-200'
                         }`}
                       >
                         Ultra
                       </button>
                     </div>
+                  </div>
+
+                  {/* Auto-convert freehand to Bézier toggle */}
+                  <div className="flex items-center justify-between pt-1">
+                    <div>
+                      <p className="text-[11px] text-slate-300 font-medium">
+                        Auto-Bézier no Traço Livre
+                      </p>
+                      <p className="text-[10px] text-slate-500">
+                        Gera alças editáveis automaticamente
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => setAutoBezierFreehand(!autoBezierFreehand)}
+                      className={`px-2.5 py-1 text-[11px] rounded-lg font-medium transition-colors cursor-pointer ${
+                        autoBezierFreehand
+                          ? 'bg-emerald-500 text-slate-950 font-bold'
+                          : 'bg-slate-800 text-slate-400'
+                      }`}
+                    >
+                      {autoBezierFreehand ? 'Ativo' : 'Polilinha'}
+                    </button>
                   </div>
 
                   <div>
@@ -1660,7 +2698,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                     </span>
                   </div>
 
-                  <div className="max-h-[180px] overflow-y-auto space-y-1.5 pr-1">
+                  <div className="max-h-[160px] overflow-y-auto space-y-1.5 pr-1">
                     {strokes.length === 0 ? (
                       <div className="p-3 text-center text-[11px] text-slate-500 border border-dashed border-slate-800 rounded-xl">
                         Nenhum objeto na prancheta.
@@ -1693,7 +2731,10 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                                   {st.isOuter ? 'Lâmina de Corte (Contorno)' : `Carimbo #${idx + 1}`}
                                 </p>
                                 <p className="text-[9px] text-slate-400">
-                                  {st.points.length} nós • {st.isClosed ? 'Fechado ✓' : 'Aberto'}
+                                  {st.bezierAnchors
+                                    ? `${st.bezierAnchors.length} âncoras Bézier`
+                                    : `${st.points.length} nós`}{' '}
+                                  • {st.isClosed ? 'Fechado ✓' : 'Aberto'}
                                 </p>
                               </div>
                             </div>
@@ -1703,10 +2744,13 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    const updated = strokes.map((s) => ({ ...s, isOuter: s.id === st.id }));
+                                    const updated = strokes.map((s) => ({
+                                      ...s,
+                                      isOuter: s.id === st.id,
+                                    }));
                                     recordHistory(updated);
                                   }}
-                                  className="px-1.5 py-0.5 text-[9px] bg-slate-800 hover:bg-amber-500 hover:text-slate-950 rounded text-slate-300 transition-colors"
+                                  className="px-1.5 py-0.5 text-[9px] bg-slate-800 hover:bg-amber-500 hover:text-slate-950 rounded text-slate-300 transition-colors cursor-pointer"
                                   title="Tornar este contorno a Lâmina do Cortador"
                                 >
                                   Lâmina
@@ -1720,7 +2764,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                                   recordHistory(reclassifyStrokes(updated));
                                   if (selectedStrokeId === st.id) setSelectedStrokeId(null);
                                 }}
-                                className="p-1 rounded text-slate-500 hover:text-rose-400 transition-colors"
+                                className="p-1 rounded text-slate-500 hover:text-rose-400 transition-colors cursor-pointer"
                               >
                                 <X className="w-3.5 h-3.5" />
                               </button>
@@ -1772,7 +2816,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                     />
                     <button
                       onClick={() => fileInputRef.current?.click()}
-                      className="absolute top-3 right-3 text-xs bg-slate-900/90 backdrop-blur-md px-3 py-1.5 rounded-lg text-slate-200 hover:text-white border border-slate-700 shadow"
+                      className="absolute top-3 right-3 text-xs bg-slate-900/90 backdrop-blur-md px-3 py-1.5 rounded-lg text-slate-200 hover:text-white border border-slate-700 shadow cursor-pointer"
                     >
                       Trocar Imagem
                     </button>
@@ -1796,11 +2840,15 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
                     />
 
                     <div className="flex items-center justify-between pt-2 border-t border-slate-800">
-                      <span className="text-xs text-slate-300">Inverter cores (se fundo for escuro)</span>
+                      <span className="text-xs text-slate-300">
+                        Inverter cores (se fundo for escuro)
+                      </span>
                       <button
                         onClick={() => setInvert(!invert)}
-                        className={`px-3 py-1 text-xs rounded-lg transition-colors ${
-                          invert ? 'bg-amber-500 text-slate-950 font-bold' : 'bg-slate-800 text-slate-400'
+                        className={`px-3 py-1 text-xs rounded-lg transition-colors cursor-pointer ${
+                          invert
+                            ? 'bg-amber-500 text-slate-950 font-bold'
+                            : 'bg-slate-800 text-slate-400'
                         }`}
                       >
                         {invert ? 'Invertido' : 'Normal'}
@@ -1855,7 +2903,7 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
               </h3>
               <button
                 onClick={() => setSvgModalOpen(false)}
-                className="text-slate-400 hover:text-white"
+                className="text-slate-400 hover:text-white cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -1867,20 +2915,20 @@ export const LineartEditor: React.FC<LineartEditorProps> = ({
               rows={8}
               value={svgTextInput}
               onChange={(e) => setSvgTextInput(e.target.value)}
-              placeholder="<svg ...><path d='M10,20 L50,80 ...' /></svg>"
+              placeholder="<svg ...><path d='M10,20 C30,5 60,5 80,20 ...' /></svg>"
               className="w-full p-3 text-xs font-mono bg-slate-950 border border-slate-700 rounded-xl text-slate-200 focus:outline-none focus:border-cyan-500"
             />
             <div className="flex justify-end gap-2 pt-2">
               <button
                 onClick={() => setSvgModalOpen(false)}
-                className="px-4 py-2 text-xs text-slate-400 hover:text-white"
+                className="px-4 py-2 text-xs text-slate-400 hover:text-white cursor-pointer"
               >
                 Cancelar
               </button>
               <button
                 onClick={() => handleImportSVGCode(svgTextInput)}
                 disabled={!svgTextInput.trim()}
-                className="px-5 py-2 text-xs font-bold bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 text-slate-950 rounded-xl"
+                className="px-5 py-2 text-xs font-bold bg-cyan-500 hover:bg-cyan-400 disabled:opacity-40 text-slate-950 rounded-xl cursor-pointer"
               >
                 Importar Vetor
               </button>
